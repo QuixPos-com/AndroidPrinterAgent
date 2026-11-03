@@ -360,13 +360,6 @@ function PrinterAgentMain(): React.JSX.Element {
     setLogs([]);
   };
 
-  const connectedPrinterCount = printerRows
-    .map(ip => ip.trim())
-    .filter(ip => ip && (printerInfoByIp[ip]?.ready || printerInfoByIp[ip]?.status === 'online'))
-    .length;
-
-  const totalConfiguredPrinters = printerRows.map(ip => ip.trim()).filter(Boolean).length;
-
   return (
     <View
       style={[

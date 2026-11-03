@@ -81,6 +81,13 @@ interface PrinterAgentNativeModule {
 
 const { PrinterAgentModule } = NativeModules;
 
-export const PrinterAgent = PrinterAgentModule as PrinterAgentNativeModule;
-export const PrinterAgentEvents = new NativeEventEmitter(PrinterAgentModule);
+const fallbackModule = {
+  addListener: () => {},
+  removeListeners: () => {},
+};
+
+export const PrinterAgent = (PrinterAgentModule || fallbackModule) as unknown as PrinterAgentNativeModule;
+export const PrinterAgentEvents = new NativeEventEmitter(
+  PrinterAgentModule || (fallbackModule as any),
+);
 
