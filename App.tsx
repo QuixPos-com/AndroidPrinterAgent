@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Platform,
-  SafeAreaView,
   ScrollView,
   StatusBar,
   StyleSheet,
@@ -11,6 +10,7 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   AgentSnapshot,
   PrinterAgent,
@@ -58,7 +58,8 @@ const getPrinterStatusDisplay = (info?: PrinterInfo) => {
   };
 };
 
-export default function App(): React.JSX.Element {
+function PrinterAgentMain(): React.JSX.Element {
+  const insets = useSafeAreaInsets();
   const [apiUrl, setApiUrl] = useState<string>('https://dash.quixpos.com');
   const [port, setPort] = useState<string>('41783');
   const [printerRows, setPrinterRows] = useState<string[]>(['']);
@@ -367,7 +368,16 @@ export default function App(): React.JSX.Element {
   const totalConfiguredPrinters = printerRows.map(ip => ip.trim()).filter(Boolean).length;
 
   return (
-    <SafeAreaView style={styles.safeArea}>
+    <View
+      style={[
+        styles.safeArea,
+        {
+          paddingTop: insets.top,
+          paddingBottom: insets.bottom,
+          paddingLeft: insets.left,
+          paddingRight: insets.right,
+        },
+      ]}>
       <StatusBar barStyle="light-content" />
 
       {/* Top Header */}
@@ -611,7 +621,7 @@ export default function App(): React.JSX.Element {
 
           {/* Foreground Notification Bar Service Card */}
           <View style={[styles.card, styles.halfCard]}>
-            <Text style={styles.cardTitle}>BENACHRICHTIGUNGSDIENST</Text>
+            <Text style={styles.cardTitle}>HINTERGRUNDDIENST</Text>
             <View style={styles.statusRowBox}>
               <Text style={styles.statusRowLabel}>Aktiv:</Text>
               <View
@@ -697,12 +707,21 @@ export default function App(): React.JSX.Element {
         <View
           style={[
             styles.toast,
+            { bottom: Math.max(insets.bottom, 14) + 8 },
             toastMsg.type === 'error' ? styles.toastError : styles.toastSuccess,
           ]}>
           <Text style={styles.toastText}>{toastMsg.text}</Text>
         </View>
       )}
-    </SafeAreaView>
+    </View>
+  );
+}
+
+export default function App(): React.JSX.Element {
+  return (
+    <SafeAreaProvider>
+      <PrinterAgentMain />
+    </SafeAreaProvider>
   );
 }
 
@@ -717,21 +736,20 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#334155',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
     backgroundColor: '#0f172a',
   },
   headerBrand: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 10,
+    gap: 8,
     flex: 1,
   },
   headerIcon: {
-    width: 36,
-    height: 36,
+    width: 32,
+    height: 32,
+    borderRadius: 8,
     backgroundColor: '#0284c7',
     alignItems: 'center',
     justifyContent: 'center',
@@ -739,11 +757,11 @@ const styles = StyleSheet.create({
   headerIconText: {
     color: '#ffffff',
     fontWeight: '800',
-    fontSize: 15,
+    fontSize: 14,
   },
   headerTitle: {
     color: '#f8fafc',
-    fontSize: 16,
+    fontSize: 15,
     fontWeight: '700',
   },
   headerSubtitle: {
@@ -754,33 +772,30 @@ const styles = StyleSheet.create({
   statusPill: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 9,
-    paddingVertical: 5,
-    borderWidth: 1,
-    gap: 6,
-  },
-  statusPillSm: {
     paddingHorizontal: 8,
     paddingVertical: 3,
-    borderWidth: 1,
+    borderRadius: 14,
+    gap: 5,
+  },
+  statusPillSm: {
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 10,
     maxWidth: 130,
   },
   pillOnline: {
     backgroundColor: 'rgba(34, 197, 94, 0.15)',
-    borderColor: 'rgba(34, 197, 94, 0.35)',
   },
   pillWarning: {
     backgroundColor: 'rgba(245, 158, 11, 0.15)',
-    borderColor: 'rgba(245, 158, 11, 0.35)',
   },
   pillOffline: {
     backgroundColor: 'rgba(239, 68, 68, 0.15)',
-    borderColor: 'rgba(239, 68, 68, 0.35)',
   },
   statusDot: {
-    width: 7,
-    height: 7,
-    borderRadius: 4,
+    width: 6,
+    height: 6,
+    borderRadius: 3,
   },
   dotOnline: {
     backgroundColor: '#22c55e',
@@ -812,16 +827,14 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   scrollContent: {
-    padding: 12,
-    gap: 12,
-    paddingBottom: 32,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    gap: 8,
+    paddingBottom: 20,
   },
   card: {
-    backgroundColor: '#1e293b',
-    borderWidth: 1,
-    borderColor: '#334155',
-    padding: 14,
-    gap: 10,
+    paddingVertical: 2,
+    gap: 6,
   },
   cardHeaderRow: {
     flexDirection: 'row',
@@ -830,83 +843,81 @@ const styles = StyleSheet.create({
   },
   cardTitle: {
     color: '#94a3b8',
-    fontSize: 12,
+    fontSize: 11,
     fontWeight: '700',
-    letterSpacing: 0.6,
+    letterSpacing: 0.5,
   },
   rowActions: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
+    gap: 6,
   },
   formGroup: {
-    gap: 5,
+    gap: 2,
   },
   label: {
     color: '#94a3b8',
-    fontSize: 11,
+    fontSize: 10,
     fontWeight: '600',
-    letterSpacing: 0.4,
+    letterSpacing: 0.3,
   },
   input: {
-    backgroundColor: '#0f172a',
-    borderWidth: 1,
-    borderColor: '#334155',
+    backgroundColor: '#1e293b',
+    borderRadius: 8,
     color: '#f8fafc',
     paddingHorizontal: 10,
-    paddingVertical: 8,
+    paddingVertical: 6,
     fontSize: 13,
     fontFamily: monoFont,
   },
   btnPrimary: {
     backgroundColor: '#38bdf8',
-    paddingVertical: 10,
-    paddingHorizontal: 14,
+    borderRadius: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
     alignItems: 'center',
     justifyContent: 'center',
-    marginTop: 4,
+    marginTop: 2,
   },
   btnPrimaryText: {
     color: '#0f172a',
     fontWeight: '700',
-    fontSize: 13,
+    fontSize: 12,
   },
   btnDanger: {
-    backgroundColor: 'rgba(239, 68, 68, 0.18)',
-    borderWidth: 1,
-    borderColor: 'rgba(239, 68, 68, 0.45)',
-    paddingVertical: 10,
+    backgroundColor: 'rgba(239, 68, 68, 0.22)',
+    borderRadius: 8,
+    paddingVertical: 8,
     paddingHorizontal: 12,
     alignItems: 'center',
     justifyContent: 'center',
-    marginTop: 4,
+    marginTop: 2,
   },
   btnDangerText: {
     color: '#fca5a5',
     fontWeight: '700',
-    fontSize: 13,
+    fontSize: 12,
   },
   btnSecondarySm: {
-    backgroundColor: '#334155',
-    borderWidth: 1,
-    borderColor: '#475569',
-    paddingHorizontal: 10,
-    paddingVertical: 5,
+    backgroundColor: '#1e293b',
+    borderRadius: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
   },
   btnSecondaryText: {
     color: '#f8fafc',
-    fontSize: 12,
+    fontSize: 11,
     fontWeight: '600',
   },
   btnOutlineSm: {
-    borderWidth: 1,
-    borderColor: '#475569',
-    paddingHorizontal: 10,
-    paddingVertical: 5,
+    backgroundColor: '#1e293b',
+    borderRadius: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
   },
   btnOutlineText: {
     color: '#cbd5e1',
-    fontSize: 12,
+    fontSize: 11,
     fontWeight: '600',
   },
   btnDisabled: {
@@ -917,11 +928,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   discoveredBox: {
-    backgroundColor: '#0f172a',
-    borderWidth: 1,
-    borderColor: '#38bdf8',
-    padding: 8,
-    gap: 6,
+    paddingVertical: 2,
+    gap: 4,
   },
   discoveredHeader: {
     flexDirection: 'row',
@@ -934,13 +942,12 @@ const styles = StyleSheet.create({
   },
   closeBtnText: {
     color: '#94a3b8',
-    fontSize: 13,
+    fontSize: 12,
     paddingHorizontal: 4,
   },
   discoveredItem: {
     backgroundColor: '#1e293b',
-    borderWidth: 1,
-    borderColor: '#334155',
+    borderRadius: 8,
     padding: 8,
   },
   discoveredItemTop: {
@@ -966,41 +973,40 @@ const styles = StyleSheet.create({
     marginTop: 2,
   },
   printerItemContainer: {
-    gap: 6,
+    gap: 4,
   },
   printerInputRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
+    gap: 6,
   },
   printerInput: {
     flex: 1,
   },
   btnRemovePrinter: {
-    borderWidth: 1,
-    borderColor: 'rgba(248, 113, 113, 0.4)',
-    paddingHorizontal: 11,
-    paddingVertical: 8,
+    backgroundColor: 'rgba(239, 68, 68, 0.15)',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   btnRemovePrinterText: {
     color: '#f87171',
-    fontSize: 13,
+    fontSize: 12,
     fontWeight: '700',
   },
   printerMetaBox: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: 'rgba(15, 23, 42, 0.7)',
-    borderWidth: 1,
-    borderColor: '#334155',
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    gap: 8,
+    paddingHorizontal: 2,
+    paddingVertical: 2,
+    gap: 6,
   },
   printerDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
+    width: 6,
+    height: 6,
+    borderRadius: 3,
   },
   printerMetaTextCol: {
     flex: 1,
@@ -1025,11 +1031,11 @@ const styles = StyleSheet.create({
     color: '#fca5a5',
     fontSize: 11,
     fontWeight: '700',
-    marginTop: 3,
+    marginTop: 2,
   },
   splitRow: {
     flexDirection: 'row',
-    gap: 10,
+    gap: 8,
   },
   halfCard: {
     flex: 1,
@@ -1039,77 +1045,68 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    backgroundColor: '#0f172a',
-    borderWidth: 1,
-    borderColor: '#334155',
-    paddingHorizontal: 10,
-    paddingVertical: 8,
+    paddingVertical: 2,
   },
   statusRowLabel: {
     color: '#f8fafc',
-    fontSize: 12,
+    fontSize: 11,
     fontWeight: '600',
   },
   pairInputRow: {
     flexDirection: 'row',
     gap: 6,
-    marginTop: 4,
+    marginTop: 2,
   },
   pinInput: {
     flex: 1,
-    paddingVertical: 7,
+    paddingVertical: 6,
   },
   btnPair: {
     backgroundColor: '#38bdf8',
-    paddingHorizontal: 12,
+    borderRadius: 8,
+    paddingHorizontal: 10,
     justifyContent: 'center',
     alignItems: 'center',
   },
   logCard: {
-    minHeight: 220,
+    minHeight: 160,
   },
   logTerminal: {
     backgroundColor: '#090d16',
-    borderWidth: 1,
-    borderColor: '#334155',
-    padding: 10,
-    height: 200,
+    borderRadius: 8,
+    padding: 8,
+    height: 160,
   },
   logEmpty: {
     color: '#64748b',
     fontFamily: monoFont,
-    fontSize: 12,
+    fontSize: 11,
   },
   logLine: {
     fontFamily: monoFont,
-    fontSize: 11,
-    lineHeight: 16,
+    fontSize: 10,
+    lineHeight: 15,
     marginBottom: 2,
   },
   toast: {
     position: 'absolute',
-    bottom: 18,
-    left: 16,
-    right: 16,
-    paddingVertical: 11,
-    paddingHorizontal: 14,
-    borderWidth: 1,
-    borderLeftWidth: 4,
+    bottom: 14,
+    left: 14,
+    right: 14,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 8,
     elevation: 6,
   },
   toastSuccess: {
-    backgroundColor: '#1e293b',
-    borderColor: '#334155',
-    borderLeftColor: '#22c55e',
+    backgroundColor: '#15803d',
   },
   toastError: {
-    backgroundColor: '#1e293b',
-    borderColor: '#334155',
-    borderLeftColor: '#ef4444',
+    backgroundColor: '#b91c1c',
   },
   toastText: {
     color: '#f8fafc',
-    fontSize: 13,
+    fontSize: 12,
     fontWeight: '600',
   },
 });

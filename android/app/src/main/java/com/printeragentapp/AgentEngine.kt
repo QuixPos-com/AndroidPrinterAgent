@@ -603,7 +603,7 @@ class AgentEngine private constructor(private val appContext: Context) {
             parts.add("$label: ${status.uppercase()}")
         }
 
-        val summary = "Drucker ($onlineCount/${printersArr.length()} online): ${parts.joinToString(" • ")}"
+        val summary = parts.joinToString("\n")
         return Pair(title, summary)
     }
 
