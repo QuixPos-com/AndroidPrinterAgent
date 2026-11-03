@@ -6,10 +6,8 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
-import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
-import android.bluetooth.BluetoothSocket
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
@@ -23,13 +21,34 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 
+/**
+ * Zebra Bluetooth LE Printer Manager based on:
+ * - Zebra Link-OS Bluetooth Low Energy Application Note (AppNote-BlueToothLE-v4.pdf)
+ * - zebra_ble_printer / universal_ble implementation (tested on Zebra ZD410)
+ *
+ * Uses Zebra BLE Parser Service (38eb4a80-c570-11e3-9507-0002a5d5c51b) and writes ZPL
+ * to "To Printer Data" (38eb4a82-c570-11e3-9507-0002a5d5c51b) in MTU-sized chunks
+ * with response (WRITE_TYPE_DEFAULT). Reads Model (0x2A24) and Serial (0x2A25) from
+ * standard BLE Device Information Service (0x180A).
+ */
 @SuppressLint("MissingPermission")
 object BlePrinterManager {
-    val ZEBRA_SERVICE_UUID: UUID = UUID.fromString("38eb4a80-c570-11e3-9507-0002a5d5c51b")
-    val ZEBRA_READ_CHAR_UUID: UUID = UUID.fromString("38eb4a81-c570-11e3-9507-0002a5d5c51b")
-    val ZEBRA_WRITE_CHAR_UUID: UUID = UUID.fromString("38eb4a82-c570-11e3-9507-0002a5d5c51b")
-    val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-    val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805f9b34fb")
+    // Zebra BLE Parser Service & Characteristics
+    val ZEBRA_PARSER_SERVICE_UUID: UUID = UUID.fromString("38eb4a80-c570-11e3-9507-0002a5d5c51b")
+    val ZEBRA_FROM_PRINTER_UUID: UUID = UUID.fromString("38eb4a81-c570-11e3-9507-0002a5d5c51b")
+    val ZEBRA_TO_PRINTER_UUID: UUID = UUID.fromString("38eb4a82-c570-11e3-9507-0002a5d5c51b")
+
+    // 16-bit service UUID (0xFE79) that Zebra printers advertise
+    val ZEBRA_ADVERTISED_SERVICE_UUID: UUID = UUID.fromString("0000fe79-0000-1000-8000-00805f9b34fb")
+
+    // Standard BLE Device Information Service (DIS 0x180A) & GAP (0x1800)
+    val DIS_SERVICE_UUID: UUID = UUID.fromString("0000180a-0000-1000-8000-00805f9b34fb")
+    val DIS_MODEL_CHAR_UUID: UUID = UUID.fromString("00002a24-0000-1000-8000-00805f9b34fb")
+    val DIS_SERIAL_CHAR_UUID: UUID = UUID.fromString("00002a25-0000-1000-8000-00805f9b34fb")
+    val GAP_SERVICE_UUID: UUID = UUID.fromString("00001800-0000-1000-8000-00805f9b34fb")
+    val GAP_DEVICE_NAME_UUID: UUID = UUID.fromString("00002a00-0000-1000-8000-00805f9b34fb")
+
+    private const val DEFAULT_MTU = 23
 
     private val ZEBRA_MAC_PREFIXES = listOf(
         "34:14:B5",
@@ -47,15 +66,34 @@ object BlePrinterManager {
     private var currentTarget: String = ""
     private var resolvedAddress: String = ""
     private var resolvedName: String = ""
+    private var deviceModel: String = ""
+    private var deviceSerial: String = ""
     private var gatt: BluetoothGatt? = null
-    private var readChar: BluetoothGattCharacteristic? = null
     private var writeChar: BluetoothGattCharacteristic? = null
-    private var sppSocket: BluetoothSocket? = null
-    private var connected: Boolean = false
-    private var negotiatedChunkSize: Int = 120
 
-    private val recvLock = Object()
-    private val recvBuf = StringBuilder()
+    @Volatile
+    private var connected: Boolean = false
+    @Volatile
+    private var negotiatedMtu: Int = DEFAULT_MTU
+
+    // Per-operation synchronization latches (populated before issuing GATT calls)
+    @Volatile
+    private var connectLatch: CountDownLatch? = null
+    @Volatile
+    private var connectStatus: Int = BluetoothGatt.GATT_SUCCESS
+
+    @Volatile
+    private var mtuLatch: CountDownLatch? = null
+
+    @Volatile
+    private var discoverLatch: CountDownLatch? = null
+    @Volatile
+    private var discoverStatus: Int = BluetoothGatt.GATT_SUCCESS
+
+    @Volatile
+    private var readLatch: CountDownLatch? = null
+    @Volatile
+    private var lastReadBytes: ByteArray? = null
 
     @Volatile
     private var writeLatch: CountDownLatch? = null
@@ -147,10 +185,19 @@ object BlePrinterManager {
         return null
     }
 
-    private fun isLikelyZebraDevice(name: String?, address: String, serviceUuids: List<ParcelUuid>? = null): Boolean {
+    /**
+     * Matches ZebraBle.looksLikeZebra from zebra_ble_printer plus known Zebra OUIs & serial prefixes.
+     */
+    private fun looksLikeZebra(
+        name: String?,
+        address: String,
+        serviceUuids: List<ParcelUuid>? = null
+    ): Boolean {
         if (serviceUuids != null) {
             for (u in serviceUuids) {
-                if (u.uuid == ZEBRA_SERVICE_UUID) return true
+                if (u.uuid == ZEBRA_PARSER_SERVICE_UUID || u.uuid == ZEBRA_ADVERTISED_SERVICE_UUID) {
+                    return true
+                }
             }
         }
         val upperAddr = address.uppercase()
@@ -175,97 +222,129 @@ object BlePrinterManager {
         return false
     }
 
-    private fun getBluetoothAdapter(): BluetoothAdapter? {
-        val ctx = appContext ?: return BluetoothAdapter.getDefaultAdapter()
-        val mgr = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-        return mgr?.adapter ?: BluetoothAdapter.getDefaultAdapter()
+    private fun getBluetoothManager(): BluetoothManager? {
+        val ctx = appContext ?: return null
+        return ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
     }
 
-    private fun resolveBLEDevice(target: String): BluetoothDevice {
-        val adapter = getBluetoothAdapter()
-            ?: throw IllegalStateException("Bluetooth adapter not available on this device")
-        if (!adapter.isEnabled) {
-            throw IllegalStateException("Bluetooth is disabled; please enable Bluetooth")
-        }
-        if (!hasBluetoothPermissions()) {
-            throw IllegalStateException("Bluetooth permissions (BLUETOOTH_SCAN / BLUETOOTH_CONNECT) not granted")
-        }
+    private fun getBluetoothAdapter(): BluetoothAdapter? {
+        return getBluetoothManager()?.adapter
+    }
 
-        val clean = cleanTargetPrefix(target)
-        val lower = clean.lowercase()
+    /**
+     * Scans BLE for up to [timeoutMs] until a matching device is found.
+     */
+    private fun scanForDevice(matcher: (BluetoothDevice, String, List<ParcelUuid>?) -> Boolean, timeoutMs: Long): Pair<BluetoothDevice, String>? {
+        val adapter = getBluetoothAdapter() ?: return null
+        val scanner = adapter.bluetoothLeScanner ?: return null
 
-        // 1. Direct MAC address (e.g. 34:14:B5:B3:89:4A or 34-14-B5-B3-89-4A or 3414b5b3894a)
-        val mac = normalizeMac(clean)
-        if (mac != null && BluetoothAdapter.checkBluetoothAddress(mac)) {
-            return adapter.getRemoteDevice(mac)
-        }
-
-        val isAuto = lower == "ble" || lower == "bluetooth" || lower == "auto" || lower.isEmpty()
-
-        // 2. Check already paired/bonded Android Bluetooth devices
-        try {
-            val bonded = adapter.bondedDevices ?: emptySet()
-            for (dev in bonded) {
-                val devName = dev.name ?: ""
-                val devAddr = dev.address ?: ""
-                if (isAuto) {
-                    if (isLikelyZebraDevice(devName, devAddr)) {
-                        return dev
-                    }
-                } else {
-                    if (devName.equals(clean, ignoreCase = true) || devAddr.equals(clean, ignoreCase = true)) {
-                        return dev
-                    }
-                }
-            }
-        } catch (_: Exception) {
-        }
-
-        // 3. Perform active BLE scan
-        val scanner = adapter.bluetoothLeScanner
-            ?: throw IllegalStateException("BLE scanner unavailable")
-
-        var foundDevice: BluetoothDevice? = null
+        var found: Pair<BluetoothDevice, String>? = null
         val latch = CountDownLatch(1)
 
         val callback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
                 val dev = result.device ?: return
-                val scanName = result.scanRecord?.deviceName ?: dev.name ?: ""
-                val addr = dev.address ?: ""
+                val scanName = result.scanRecord?.deviceName?.takeIf { it.isNotBlank() }
+                    ?: try { dev.name ?: "" } catch (_: Exception) { "" }
                 val uuids = result.scanRecord?.serviceUuids
-
-                val match = if (isAuto) {
-                    isLikelyZebraDevice(scanName, addr, uuids)
-                } else {
-                    scanName.equals(clean, ignoreCase = true) ||
-                        addr.equals(clean, ignoreCase = true) ||
-                        scanName.lowercase().contains(lower)
-                }
-
-                if (match && foundDevice == null) {
-                    foundDevice = dev
-                    resolvedName = scanName
+                if (matcher(dev, scanName, uuids) && found == null) {
+                    found = Pair(dev, scanName)
                     latch.countDown()
                 }
             }
         }
 
-        val settings = ScanSettings.Builder()
+        val settingsBuilder = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            .build()
+        if (Build.VERSION.SDK_INT >= 26) {
+            settingsBuilder.setPhy(ScanSettings.PHY_LE_ALL_SUPPORTED)
+            settingsBuilder.setLegacy(false)
+        }
 
         try {
-            scanner.startScan(null, settings, callback)
-            latch.await(3500, TimeUnit.MILLISECONDS)
+            scanner.startScan(null, settingsBuilder.build(), callback)
+            latch.await(timeoutMs, TimeUnit.MILLISECONDS)
+        } catch (_: Exception) {
         } finally {
             try {
                 scanner.stopScan(callback)
             } catch (_: Exception) {
             }
         }
+        return found
+    }
 
-        return foundDevice ?: throw IllegalStateException("No Zebra BLE printer found matching \"$target\"")
+    private fun resolveBLEDevice(target: String, forceScan: Boolean = false): BluetoothDevice {
+        val adapter = getBluetoothAdapter()
+            ?: throw IllegalStateException("Bluetooth adapter not available")
+        if (!adapter.isEnabled) {
+            throw IllegalStateException("Bluetooth is turned off")
+        }
+        if (!hasBluetoothPermissions()) {
+            throw IllegalStateException("Bluetooth permissions not granted")
+        }
+
+        val clean = cleanTargetPrefix(target)
+        val lower = clean.lowercase()
+        val mac = normalizeMac(clean)
+
+        // 1. Direct MAC address
+        if (mac != null && BluetoothAdapter.checkBluetoothAddress(mac)) {
+            if (forceScan) {
+                val scanned = scanForDevice({ dev, _, _ -> dev.address.equals(mac, ignoreCase = true) }, 4000L)
+                if (scanned != null) {
+                    if (scanned.second.isNotEmpty()) resolvedName = scanned.second
+                    return scanned.first
+                }
+            }
+            return adapter.getRemoteDevice(mac)
+        }
+
+        val isAuto = lower == "ble" || lower == "bluetooth" || lower == "auto" || lower.isEmpty()
+
+        // 2. Check already connected GATT devices and bonded devices
+        val candidates = ArrayList<BluetoothDevice>()
+        try {
+            getBluetoothManager()?.getConnectedDevices(BluetoothProfile.GATT)?.let { candidates.addAll(it) }
+        } catch (_: Exception) {
+        }
+        try {
+            adapter.bondedDevices?.let { candidates.addAll(it) }
+        } catch (_: Exception) {
+        }
+
+        for (dev in candidates) {
+            val devName = try { dev.name ?: "" } catch (_: Exception) { "" }
+            val devAddr = dev.address ?: ""
+            if (isAuto) {
+                if (looksLikeZebra(devName, devAddr)) {
+                    if (devName.isNotEmpty()) resolvedName = devName
+                    return dev
+                }
+            } else if (devName.equals(clean, ignoreCase = true) || devAddr.equals(clean, ignoreCase = true)) {
+                if (devName.isNotEmpty()) resolvedName = devName
+                return dev
+            }
+        }
+
+        // 3. Scan for BLE advertisements
+        val scanned = scanForDevice({ dev, scanName, uuids ->
+            val addr = dev.address ?: ""
+            if (isAuto) {
+                looksLikeZebra(scanName, addr, uuids)
+            } else {
+                scanName.equals(clean, ignoreCase = true) ||
+                    addr.equals(clean, ignoreCase = true) ||
+                    (scanName.isNotEmpty() && scanName.lowercase().contains(lower))
+            }
+        }, 5000L)
+
+        if (scanned != null) {
+            if (scanned.second.isNotEmpty()) resolvedName = scanned.second
+            return scanned.first
+        }
+
+        throw IllegalStateException("No Zebra BLE printer found matching \"$target\"")
     }
 
     fun disconnect() {
@@ -279,180 +358,127 @@ object BlePrinterManager {
 
     private fun disconnectLocked() {
         connected = false
-        readChar = null
         writeChar = null
-        try {
-            gatt?.disconnect()
-        } catch (_: Exception) {
-        }
-        try {
-            gatt?.close()
-        } catch (_: Exception) {
-        }
+        negotiatedMtu = DEFAULT_MTU
+        val g = gatt
         gatt = null
-
-        try {
-            sppSocket?.close()
-        } catch (_: Exception) {
+        if (g != null) {
+            try {
+                g.disconnect()
+            } catch (_: Exception) {
+            }
+            try {
+                g.close()
+            } catch (_: Exception) {
+            }
         }
-        sppSocket = null
     }
 
     private fun ensureConnectedLocked(target: String) {
-        if (connected && currentTarget == target && (gatt != null || sppSocket?.isConnected == true)) {
+        if (connected && currentTarget == target && gatt != null && writeChar != null) {
             return
         }
 
         disconnectLocked()
 
         val ctx = appContext ?: throw IllegalStateException("BlePrinterManager context not initialized")
-        val device = resolveBLEDevice(target)
-        resolvedAddress = device.address ?: ""
-        if (resolvedName.isEmpty()) {
-            resolvedName = try {
-                device.name ?: ""
-            } catch (_: Exception) {
-                ""
-            }
+
+        // Try direct connect first; if the device hasn't been seen in BLE scan cache yet, scan & retry once
+        var device = resolveBLEDevice(target, forceScan = false)
+        var err = connectAndDiscoverLocked(ctx, device, target)
+        if (err != null && normalizeMac(target) != null) {
+            device = resolveBLEDevice(target, forceScan = true)
+            err = connectAndDiscoverLocked(ctx, device, target)
         }
 
-        // Try BLE GATT connection first (Zebra BLE service 38eb4a80-c570-11e3-9507-0002a5d5c51b)
-        val gattErr = tryConnectGattLocked(ctx, device, target)
-        if (gattErr == null) {
-            return
+        if (err != null) {
+            throw err
         }
-
-        // Fallback to Bluetooth Classic SPP RFCOMM if BLE GATT service wasn't found (e.g. Classic BT Zebra)
-        val sppErr = tryConnectSppLocked(device, target)
-        if (sppErr == null) {
-            return
-        }
-
-        throw IllegalStateException("BLE connect to ${device.address} failed: ${gattErr.message}")
     }
 
-    private fun tryConnectGattLocked(ctx: Context, device: BluetoothDevice, target: String): Exception? {
-        val readyLatch = CountDownLatch(1)
-        var connectError: Exception? = null
-        negotiatedChunkSize = 120
+    private fun connectAndDiscoverLocked(ctx: Context, device: BluetoothDevice, target: String): Exception? {
+        resolvedAddress = device.address ?: ""
+        val initialName = try { device.name ?: "" } catch (_: Exception) { "" }
+        if (initialName.isNotEmpty()) {
+            resolvedName = initialName
+        }
+
+        val cLatch = CountDownLatch(1)
+        connectLatch = cLatch
+        connectStatus = BluetoothGatt.GATT_FAILURE
+        negotiatedMtu = DEFAULT_MTU
 
         val callback = object : BluetoothGattCallback() {
             override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
-                    try {
-                        // Request larger MTU if supported, or discover services immediately
-                        val mtuRequested = g.requestMtu(256)
-                        if (!mtuRequested) {
-                            g.discoverServices()
-                        }
-                    } catch (_: Exception) {
-                        g.discoverServices()
-                    }
+                    connectStatus = BluetoothGatt.GATT_SUCCESS
+                    connected = true
+                    connectLatch?.countDown()
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     connected = false
-                    if (readyLatch.count > 0) {
-                        connectError = IllegalStateException("GATT disconnected (status=$status)")
-                        readyLatch.countDown()
+                    connectStatus = if (status == BluetoothGatt.GATT_SUCCESS) -1 else status
+                    connectLatch?.countDown()
+                    mtuLatch?.countDown()
+                    discoverLatch?.countDown()
+                    readLatch?.countDown()
+                    writeLatch?.countDown()
+                    if (gatt === g) {
+                        try {
+                            g.close()
+                        } catch (_: Exception) {
+                        }
+                        gatt = null
+                        writeChar = null
                     }
                 }
             }
 
             override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
-                if (status == BluetoothGatt.GATT_SUCCESS && mtu > 23) {
-                    negotiatedChunkSize = (mtu - 3).coerceIn(20, 180)
+                if (status == BluetoothGatt.GATT_SUCCESS && mtu >= DEFAULT_MTU) {
+                    negotiatedMtu = mtu
                 }
-                g.discoverServices()
+                mtuLatch?.countDown()
             }
 
             override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
-                if (status != BluetoothGatt.GATT_SUCCESS) {
-                    connectError = IllegalStateException("GATT service discovery failed ($status)")
-                    readyLatch.countDown()
-                    return
-                }
-
-                var foundRead: BluetoothGattCharacteristic? = null
-                var foundWrite: BluetoothGattCharacteristic? = null
-
-                val zebraSvc = g.getService(ZEBRA_SERVICE_UUID)
-                val servicesToCheck = if (zebraSvc != null) listOf(zebraSvc) else g.services
-
-                for (svc in servicesToCheck) {
-                    for (c in svc.characteristics) {
-                        val uStr = c.uuid.toString().lowercase()
-                        if (uStr.startsWith("38eb4a81")) {
-                            foundRead = c
-                        } else if (uStr.startsWith("38eb4a82")) {
-                            foundWrite = c
-                        }
-                    }
-                }
-
-                if (foundRead == null || foundWrite == null) {
-                    connectError = IllegalStateException("Zebra BLE read/write characteristics (38eb4a81/38eb4a82) not found")
-                    readyLatch.countDown()
-                    return
-                }
-
-                readChar = foundRead
-                writeChar = foundWrite
-
-                g.setCharacteristicNotification(foundRead, true)
-                val cccd = foundRead.getDescriptor(CCCD_UUID)
-                if (cccd != null) {
-                    val props = foundRead.properties
-                    val enableVal = if ((props and BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0) {
-                        BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
-                    } else {
-                        BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                    }
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        val res = g.writeDescriptor(cccd, enableVal)
-                        if (res != BluetoothGatt.GATT_SUCCESS) {
-                            readyLatch.countDown()
-                        }
-                    } else {
-                        @Suppress("DEPRECATION")
-                        cccd.value = enableVal
-                        @Suppress("DEPRECATION")
-                        if (!g.writeDescriptor(cccd)) {
-                            readyLatch.countDown()
-                        }
-                    }
-                } else {
-                    readyLatch.countDown()
-                }
+                discoverStatus = status
+                discoverLatch?.countDown()
             }
 
-            override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
-                readyLatch.countDown()
-            }
-
-            override fun onCharacteristicWrite(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
-                lastWriteStatus = status
-                writeLatch?.countDown()
-            }
-
-            override fun onCharacteristicChanged(
+            override fun onCharacteristicRead(
                 g: BluetoothGatt,
                 characteristic: BluetoothGattCharacteristic,
-                value: ByteArray
+                value: ByteArray,
+                status: Int
             ) {
-                appendReceivedBytes(value)
+                lastReadBytes = if (status == BluetoothGatt.GATT_SUCCESS) value else null
+                readLatch?.countDown()
             }
 
             @Deprecated("Deprecated in API 33")
-            override fun onCharacteristicChanged(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+            override fun onCharacteristicRead(
+                g: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                status: Int
+            ) {
                 if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
                     @Suppress("DEPRECATION")
-                    val bytes = characteristic.value
-                    if (bytes != null) {
-                        appendReceivedBytes(bytes)
-                    }
+                    lastReadBytes = if (status == BluetoothGatt.GATT_SUCCESS) characteristic.value else null
+                    readLatch?.countDown()
                 }
+            }
+
+            override fun onCharacteristicWrite(
+                g: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                status: Int
+            ) {
+                lastWriteStatus = status
+                writeLatch?.countDown()
             }
         }
 
+        // 1. Connect GATT (matching UniversalBle.connect)
         val g = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             device.connectGatt(ctx, false, callback, BluetoothDevice.TRANSPORT_LE)
         } else {
@@ -460,149 +486,214 @@ object BlePrinterManager {
         } ?: return IllegalStateException("connectGatt returned null")
 
         gatt = g
-        val completed = readyLatch.await(8500, TimeUnit.MILLISECONDS)
-        if (!completed || connectError != null || readChar == null || writeChar == null) {
-            val err = connectError ?: IllegalStateException("timeout connecting to Zebra BLE GATT")
+
+        if (!cLatch.await(10_000, TimeUnit.MILLISECONDS) || !connected || connectStatus != BluetoothGatt.GATT_SUCCESS) {
             disconnectLocked()
-            return err
+            return IllegalStateException("BLE connection to ${device.address} failed (status=$connectStatus)")
         }
 
+        // 2. Negotiate MTU (matching ZebraBlePrinter._negotiateMtu: request 512, fallback to 23)
+        val mLatch = CountDownLatch(1)
+        mtuLatch = mLatch
+        try {
+            if (g.requestMtu(512)) {
+                mLatch.await(3000, TimeUnit.MILLISECONDS)
+            }
+        } catch (_: Exception) {
+        } finally {
+            mtuLatch = null
+        }
+
+        if (!connected) {
+            disconnectLocked()
+            return IllegalStateException("BLE disconnected during MTU negotiation")
+        }
+
+        // 3. Discover Services (matching UniversalBle.discoverServices)
+        val dLatch = CountDownLatch(1)
+        discoverLatch = dLatch
+        discoverStatus = BluetoothGatt.GATT_FAILURE
+        val startedDiscover = try {
+            g.discoverServices()
+        } catch (_: Exception) {
+            false
+        }
+        if (!startedDiscover || !dLatch.await(8000, TimeUnit.MILLISECONDS) || discoverStatus != BluetoothGatt.GATT_SUCCESS) {
+            discoverLatch = null
+            disconnectLocked()
+            return IllegalStateException("BLE service discovery failed on ${device.address} (status=$discoverStatus)")
+        }
+        discoverLatch = null
+
+        // 4. Find writable "To Printer Data" characteristic (38eb4a82-c570-11e3-9507-0002a5d5c51b)
+        var foundWrite: BluetoothGattCharacteristic? = null
+        for (svc in g.services) {
+            for (c in svc.characteristics) {
+                if (c.uuid == ZEBRA_TO_PRINTER_UUID &&
+                    (c.properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE)) != 0
+                ) {
+                    foundWrite = c
+                    break
+                }
+            }
+            if (foundWrite != null) break
+        }
+
+        if (foundWrite == null) {
+            disconnectLocked()
+            return IllegalStateException("Zebra print characteristic (38eb4a82) not found on ${device.address}")
+        }
+
+        writeChar = foundWrite
         currentTarget = target
-        connected = true
+
+        // 5. Read Model Name (0x2A24) and Serial Number (0x2A25) from BLE Device Information Service (0x180A)
+        // as documented on Page 4 of Zebra's AppNote-BlueToothLE-v4.pdf
+        val disService = g.getService(DIS_SERVICE_UUID)
+        if (disService != null) {
+            val modelChar = disService.getCharacteristic(DIS_MODEL_CHAR_UUID)
+            if (modelChar != null) {
+                readCharacteristicStringLocked(g, modelChar)?.takeIf { it.isNotEmpty() }?.let {
+                    deviceModel = it
+                }
+            }
+            val serialChar = disService.getCharacteristic(DIS_SERIAL_CHAR_UUID)
+            if (serialChar != null) {
+                readCharacteristicStringLocked(g, serialChar)?.takeIf { it.isNotEmpty() }?.let {
+                    deviceSerial = it
+                }
+            }
+        }
+
+        if (deviceSerial.isEmpty()) {
+            val gapService = g.getService(GAP_SERVICE_UUID)
+            val nameChar = gapService?.getCharacteristic(GAP_DEVICE_NAME_UUID)
+            if (nameChar != null) {
+                readCharacteristicStringLocked(g, nameChar)?.takeIf { it.isNotEmpty() }?.let {
+                    resolvedName = it
+                }
+            }
+        }
+
+        if (deviceSerial.isEmpty()) {
+            deviceSerial = if (resolvedName.length in 6..24 && !resolvedName.contains(" ")) {
+                resolvedName
+            } else {
+                resolvedAddress.replace(":", "")
+            }
+        }
+        if (deviceModel.isEmpty()) {
+            deviceModel = if (resolvedName.isNotEmpty() && !resolvedName.equals(deviceSerial, ignoreCase = true)) {
+                resolvedName
+            } else {
+                "Zebra BLE Printer"
+            }
+        }
+
+        log("BLE connected to ${device.address} (model=\"$deviceModel\" serial=\"$deviceSerial\" mtu=$negotiatedMtu)")
         return null
     }
 
-    private fun tryConnectSppLocked(device: BluetoothDevice, target: String): Exception? {
+    private fun readCharacteristicStringLocked(
+        g: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic
+    ): String? {
+        if ((characteristic.properties and BluetoothGattCharacteristic.PROPERTY_READ) == 0) {
+            return null
+        }
+        val rLatch = CountDownLatch(1)
+        readLatch = rLatch
+        lastReadBytes = null
         return try {
-            val sock = device.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
-            sock.connect()
-            sppSocket = sock
-            currentTarget = target
-            connected = true
-            // Start background reader thread for SPP socket
-            Thread({
-                val buf = ByteArray(1024)
-                val input = try {
-                    sock.inputStream
-                } catch (_: Exception) {
-                    null
-                }
-                while (connected && sppSocket == sock && input != null) {
-                    val n = try {
-                        input.read(buf)
-                    } catch (_: Exception) {
-                        break
-                    }
-                    if (n > 0) {
-                        appendReceivedBytes(buf.copyOfRange(0, n))
-                    } else if (n < 0) {
-                        break
-                    }
-                }
-            }, "ZebraSppReader").apply {
-                isDaemon = true
-                start()
+            if (!g.readCharacteristic(characteristic)) {
+                return null
             }
+            if (!rLatch.await(2500, TimeUnit.MILLISECONDS)) {
+                return null
+            }
+            val bytes = lastReadBytes ?: return null
+            String(bytes, Charsets.UTF_8).trim { it <= ' ' || it == '\u0000' }
+        } catch (_: Exception) {
             null
-        } catch (e: Exception) {
-            disconnectLocked()
-            e
+        } finally {
+            readLatch = null
         }
     }
 
-    private fun appendReceivedBytes(bytes: ByteArray) {
-        if (bytes.isEmpty()) return
-        val chunk = String(bytes, Charsets.UTF_8)
-        synchronized(recvLock) {
-            recvBuf.append(chunk)
-            recvLock.notifyAll()
-        }
-    }
-
+    /**
+     * Replicates chunkedWrite from zebra_ble_printer/lib/src/chunked_write.dart:
+     * Splits [data] into blocks of min(mtu - 3, 512) bytes and writes each chunk
+     * with response (WRITE_TYPE_DEFAULT) so the printer buffer never overflows.
+     * If the printer rejects a larger chunk (e.g. status 134 / 0x86 when attribute
+     * length is capped at 20 bytes despite a higher L2CAP MTU), automatically falls
+     * back to 20-byte chunks (DEFAULT_MTU - 3).
+     */
     private fun writeChunksLocked(data: ByteArray) {
-        val spp = sppSocket
-        if (spp != null && spp.isConnected) {
-            val out = spp.outputStream
-            out.write(data)
-            out.flush()
-            return
-        }
-
         val g = gatt ?: throw IllegalStateException("BLE GATT not connected")
         val wc = writeChar ?: throw IllegalStateException("BLE write characteristic not initialized")
-        val chunkSize = negotiatedChunkSize.coerceIn(20, 180)
 
+        var chunkSize = (negotiatedMtu - 3).coerceIn(1, 512)
         var offset = 0
+
         while (offset < data.size) {
             val end = (offset + chunkSize).coerceAtMost(data.size)
             val slice = data.copyOfRange(offset, end)
-            val latch = CountDownLatch(1)
-            writeLatch = latch
-            lastWriteStatus = BluetoothGatt.GATT_SUCCESS
 
-            val props = wc.properties
-            val writeType = if ((props and BluetoothGattCharacteristic.PROPERTY_WRITE) != 0) {
-                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-            } else {
-                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-            }
-
-            val started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                g.writeCharacteristic(wc, slice, writeType) == BluetoothGatt.GATT_SUCCESS
-            } else {
-                @Suppress("DEPRECATION")
-                wc.writeType = writeType
-                @Suppress("DEPRECATION")
-                wc.value = slice
-                @Suppress("DEPRECATION")
-                g.writeCharacteristic(wc)
-            }
-
-            if (!started) {
+            val status = writeSingleChunkLocked(g, wc, slice)
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                // If chunk > 20 bytes failed (e.g. status=134 on ZD410), downgrade to 20-byte chunks and retry
+                if (chunkSize > 20) {
+                    log("BLE write chunk ($chunkSize bytes) returned status=$status; falling back to 20-byte chunks")
+                    negotiatedMtu = DEFAULT_MTU
+                    chunkSize = 20
+                    continue
+                }
                 disconnectLocked()
-                throw IllegalStateException("BLE writeCharacteristic failed to initiate")
-            }
-
-            if (!latch.await(5000, TimeUnit.MILLISECONDS) || lastWriteStatus != BluetoothGatt.GATT_SUCCESS) {
-                disconnectLocked()
-                throw IllegalStateException("BLE writeCharacteristic timed out or failed (status=$lastWriteStatus)")
+                throw IllegalStateException("BLE writeCharacteristic failed (status=$status)")
             }
 
             offset = end
         }
     }
 
-    private fun queryLocked(
-        target: String,
-        cmd: String,
-        timeoutMs: Long,
-        until: (String) -> Boolean
-    ): String {
-        ensureConnectedLocked(target)
+    private fun writeSingleChunkLocked(
+        g: BluetoothGatt,
+        wc: BluetoothGattCharacteristic,
+        slice: ByteArray
+    ): Int {
+        val latch = CountDownLatch(1)
+        writeLatch = latch
+        lastWriteStatus = BluetoothGatt.GATT_FAILURE
 
-        synchronized(recvLock) {
-            recvBuf.setLength(0)
+        val writeType = if ((wc.properties and BluetoothGattCharacteristic.PROPERTY_WRITE) != 0) {
+            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        } else {
+            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
         }
 
-        writeChunksLocked(cmd.toByteArray(Charsets.UTF_8))
-
-        val deadline = System.currentTimeMillis() + timeoutMs
-        while (true) {
-            val currentStr = synchronized(recvLock) { recvBuf.toString() }
-            if (until(currentStr)) {
-                return currentStr
+        val initiated = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                g.writeCharacteristic(wc, slice, writeType) == BluetoothGatt.GATT_SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                wc.value = slice
+                @Suppress("DEPRECATION")
+                wc.writeType = writeType
+                @Suppress("DEPRECATION")
+                g.writeCharacteristic(wc)
             }
-            val remain = deadline - System.currentTimeMillis()
-            if (remain <= 0) {
-                return currentStr
-            }
-            synchronized(recvLock) {
-                try {
-                    recvLock.wait(remain.coerceAtMost(250L))
-                } catch (_: InterruptedException) {
-                }
-            }
+        } catch (_: Exception) {
+            false
         }
+
+        if (!initiated) {
+            writeLatch = null
+            return BluetoothGatt.GATT_FAILURE
+        }
+
+        val completed = latch.await(15_000, TimeUnit.MILLISECONDS)
+        writeLatch = null
+        return if (completed) lastWriteStatus else -1
     }
 
     fun queryPrinterInfoLocked(target: String): PrinterInfo {
@@ -616,46 +707,24 @@ object BlePrinterManager {
 
         mu.lock()
         try {
-            // Query Model (~HI), Errors (~HQES), Serial (device.unique_id), and Label Length (zpl.label_length)
-            val cmd = "~HI~HQES! U1 getvar \"device.unique_id\"\r\n! U1 getvar \"zpl.label_length\"\r\n"
-            val data = queryLocked(target, cmd, 3500L) { str ->
-                val hqesEnd = str.indexOf("WARNINGS:")
-                val hasCompleteHQES = hqesEnd != -1 && str.substring(hqesEnd).contains("\u0003")
-                val hasSGD = str.count { it == '"' } >= 4
-                hasCompleteHQES && hasSGD
-            }
-
-            if (data.isBlank()) {
-                // If connected over BLE GATT, even if ZPL status response timed out, check if we have device identity
-                if (connected && resolvedAddress.isNotEmpty()) {
-                    val fallbackSerial = if (resolvedName.length >= 6 && !resolvedName.contains(" ")) {
-                        resolvedName
-                    } else {
-                        resolvedAddress.replace(":", "")
-                    }
-                    return PrinterInfo(
-                        ip = target,
-                        serial = fallbackSerial,
-                        model = resolvedName.ifEmpty { "Zebra BLE Printer" },
-                        type = "zpl",
-                        ready = true,
-                        status = "online",
-                        errors = PrinterErrors(unreachable = false)
-                    )
-                }
-                return offlineInfo
-            }
-
-            val parsed = PrinterProtocol.parsePrinterData(target, data)
-            val finalSerial = parsed.serial.ifEmpty {
-                if (resolvedName.length in 6..24 && !resolvedName.contains(" ")) resolvedName else ""
-            }
-            val finalModel = parsed.model.ifEmpty {
-                resolvedName.ifEmpty { "Zebra BLE" }
-            }
-            return parsed.copy(serial = finalSerial, model = finalModel)
+            ensureConnectedLocked(target)
+            return PrinterInfo(
+                ip = target,
+                serial = deviceSerial,
+                model = deviceModel.ifEmpty { "Zebra BLE Printer" },
+                type = "zpl",
+                labelLength = null,
+                errors = PrinterErrors(
+                    headOpen = false,
+                    pause = false,
+                    other = false,
+                    unreachable = false
+                ),
+                ready = true,
+                status = "online"
+            )
         } catch (e: Exception) {
-            log("BLE query failed for $target: ${e.message}")
+            log("BLE connect/status check failed for $target: ${e.message}")
             disconnectLocked()
             return offlineInfo
         } finally {
@@ -676,37 +745,9 @@ object BlePrinterManager {
     fun queryStatusLocked(target: String): HostStatus {
         mu.lock()
         try {
-            val data = queryLocked(target, "~HS\r\n", 3000L) { str ->
-                str.count { it == '\n' } >= 3 && str.count { it == ',' } >= 20
-            }
-
-            if (data.isBlank()) {
-                throw IllegalStateException("empty ~HS response via BLE")
-            }
-
-            val lines = data.split("\n")
-                .map { it.trim { ch -> ch == '\u0002' || ch == '\u0003' || ch == '\r' || ch == '\n' || ch == ' ' } }
-                .filter { it.isNotEmpty() && it.contains(",") }
-
-            if (lines.size < 2) {
-                throw IllegalStateException("unexpected ~HS response via BLE: $data")
-            }
-
-            val f1 = lines[0].split(",")
-            val f2 = lines[1].split(",")
-            if (f1.size < 5 || f2.size < 10) {
-                throw IllegalStateException("malformed ~HS fields via BLE")
-            }
-
-            return HostStatus(
-                paperOut = f1[1].trim() == "1",
-                paused = f1[2].trim() == "1",
-                formatsInBuffer = f1[4].trim().toIntOrNull() ?: 0,
-                headUp = f2[2].trim() == "1",
-                ribbonOut = f2[3].trim() == "1",
-                labelsRemaining = f2[8].trim().toIntOrNull() ?: 0,
-                printingFormat = f2[9].trim() == "1"
-            )
+            ensureConnectedLocked(target)
+            // As noted in zebra_ble_printer, Zebra BLE printers do not use ~HS polling over 38eb4a81
+            return HostStatus()
         } finally {
             mu.unlock()
         }
@@ -720,29 +761,50 @@ object BlePrinterManager {
 
         val discoveredByMac = LinkedHashMap<String, String>()
 
-        // 1. Inspect bonded devices
+        // 0. If already connected to a BLE printer, include it first (connected BLE devices stop advertising)
+        mu.lock()
+        val activeAddr = if (connected) resolvedAddress else ""
+        val activeModel = deviceModel
+        val activeSerial = deviceSerial
+        mu.unlock()
+        if (activeAddr.isNotEmpty()) {
+            discoveredByMac[activeAddr] = activeModel.ifEmpty { activeSerial }
+        }
+
+        // 1. Check connected GATT devices and bonded devices
         try {
-            val bonded = adapter.bondedDevices ?: emptySet()
-            for (dev in bonded) {
-                val addr = dev.address ?: continue
-                val name = dev.name ?: ""
-                if (isLikelyZebraDevice(name, addr)) {
+            getBluetoothManager()?.getConnectedDevices(BluetoothProfile.GATT)?.forEach { dev ->
+                val addr = dev.address ?: return@forEach
+                val name = try { dev.name ?: "" } catch (_: Exception) { "" }
+                if (looksLikeZebra(name, addr)) {
                     discoveredByMac[addr] = name
                 }
             }
         } catch (_: Exception) {
         }
 
-        // 2. Active BLE scan for 3 seconds
+        try {
+            adapter.bondedDevices?.forEach { dev ->
+                val addr = dev.address ?: return@forEach
+                val name = try { dev.name ?: "" } catch (_: Exception) { "" }
+                if (looksLikeZebra(name, addr) && !discoveredByMac.containsKey(addr)) {
+                    discoveredByMac[addr] = name
+                }
+            }
+        } catch (_: Exception) {
+        }
+
+        // 2. Active BLE scan (5 seconds, matching zebra_ble_printer.scan)
         val scanner = adapter.bluetoothLeScanner
         if (scanner != null) {
             val callback = object : ScanCallback() {
                 override fun onScanResult(callbackType: Int, result: ScanResult) {
                     val dev = result.device ?: return
                     val addr = dev.address ?: return
-                    val name = result.scanRecord?.deviceName ?: dev.name ?: ""
+                    val name = result.scanRecord?.deviceName?.takeIf { it.isNotBlank() }
+                        ?: try { dev.name ?: "" } catch (_: Exception) { "" }
                     val uuids = result.scanRecord?.serviceUuids
-                    if (isLikelyZebraDevice(name, addr, uuids)) {
+                    if (looksLikeZebra(name, addr, uuids)) {
                         synchronized(discoveredByMac) {
                             if (!discoveredByMac.containsKey(addr) || discoveredByMac[addr].isNullOrEmpty()) {
                                 discoveredByMac[addr] = name
@@ -752,13 +814,16 @@ object BlePrinterManager {
                 }
             }
 
-            val settings = ScanSettings.Builder()
+            val settingsBuilder = ScanSettings.Builder()
                 .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-                .build()
+            if (Build.VERSION.SDK_INT >= 26) {
+                settingsBuilder.setPhy(ScanSettings.PHY_LE_ALL_SUPPORTED)
+                settingsBuilder.setLegacy(false)
+            }
 
             try {
-                scanner.startScan(null, settings, callback)
-                Thread.sleep(3000)
+                scanner.startScan(null, settingsBuilder.build(), callback)
+                Thread.sleep(4000)
             } catch (_: Exception) {
             } finally {
                 try {
@@ -771,11 +836,19 @@ object BlePrinterManager {
         val results = ArrayList<PrinterInfo>()
         for ((mac, advName) in discoveredByMac) {
             val bleTarget = "ble:$mac"
-            val probed = queryPrinterInfoLocked(bleTarget)
-            if (!probed.errors.unreachable) {
-                results.add(probed)
+            if (mac.equals(activeAddr, ignoreCase = true) && activeSerial.isNotEmpty()) {
+                results.add(
+                    PrinterInfo(
+                        ip = bleTarget,
+                        serial = activeSerial,
+                        model = activeModel.ifEmpty { "Zebra BLE Printer" },
+                        type = "zpl",
+                        ready = true,
+                        status = "online",
+                        errors = PrinterErrors(unreachable = false)
+                    )
+                )
             } else {
-                // Still surface the discovered BLE printer so the user can tap to add it
                 val serialGuess = if (advName.length in 6..24 && !advName.contains(" ")) advName else ""
                 results.add(
                     PrinterInfo(
@@ -783,8 +856,8 @@ object BlePrinterManager {
                         serial = serialGuess,
                         model = advName.ifEmpty { "Zebra BLE Printer" },
                         type = "zpl",
-                        ready = false,
-                        status = "discovered",
+                        ready = true,
+                        status = "online",
                         errors = PrinterErrors(unreachable = false)
                     )
                 )
@@ -793,4 +866,3 @@ object BlePrinterManager {
         return results
     }
 }
-
