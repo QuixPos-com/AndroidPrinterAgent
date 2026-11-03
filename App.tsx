@@ -18,6 +18,46 @@ import {
   PrinterInfo,
 } from './src/native/PrinterAgent';
 
+const getPrinterStatusDisplay = (info?: PrinterInfo) => {
+  if (!info) return { text: 'UNBEKANNT', color: '#94a3b8', errorAlert: null };
+  if (info.errors?.headOpen || info.status === 'headOpen') {
+    return {
+      text: 'DRUCKERKOPF OFFEN',
+      color: '#ef4444',
+      errorAlert: '⚠️ Druckerkopf ist geöffnet! Bitte Klappe schließen.',
+    };
+  }
+  if (info.errors?.pause || info.status === 'pause') {
+    return {
+      text: 'PAUSIERT',
+      color: '#f59e0b',
+      errorAlert: '⏸️ Drucker ist pausiert! Bitte Pause-Taste am Drucker drücken.',
+    };
+  }
+  if (info.errors?.unreachable || info.status === 'offline') {
+    return {
+      text: 'NICHT ERREICHBAR',
+      color: '#ef4444',
+      errorAlert: null,
+    };
+  }
+  if (info.errors?.other || info.status === 'error') {
+    return {
+      text: 'DRUCKERFEHLER',
+      color: '#ef4444',
+      errorAlert: '⚠️ Drucker meldet einen Fehler (Papier/Farbband prüfen).',
+    };
+  }
+  if (info.ready || info.status === 'online') {
+    return { text: 'BEREIT / ONLINE', color: '#22c55e', errorAlert: null };
+  }
+  return {
+    text: (info.status || 'UNBEKANNT').toUpperCase(),
+    color: '#f59e0b',
+    errorAlert: null,
+  };
+};
+
 export default function App(): React.JSX.Element {
   const [apiUrl, setApiUrl] = useState<string>('https://dash.quixpos.com');
   const [port, setPort] = useState<string>('41783');
@@ -465,12 +505,7 @@ export default function App(): React.JSX.Element {
           {printerRows.map((ipVal, idx) => {
             const cleanIp = ipVal.trim();
             const info = cleanIp ? printerInfoByIp[cleanIp] : undefined;
-            const isOnline = info?.ready || info?.status === 'online';
-            const statusColor = isOnline
-              ? '#22c55e'
-              : info?.status === 'offline'
-                ? '#ef4444'
-                : '#f59e0b';
+            const statusDisplay = getPrinterStatusDisplay(info);
 
             return (
               <View key={`printer-row-${idx}`} style={styles.printerItemContainer}>
@@ -491,17 +526,17 @@ export default function App(): React.JSX.Element {
                   </TouchableOpacity>
                 </View>
 
-                {info && (info.model || info.serial || info.status) && (
+                {info && (info.model || info.serial || info.status || info.labelLength != null) && (
                   <View style={styles.printerMetaBox}>
-                    <View style={[styles.printerDot, { backgroundColor: statusColor }]} />
+                    <View style={[styles.printerDot, { backgroundColor: statusDisplay.color }]} />
                     <View style={styles.printerMetaTextCol}>
                       <Text style={styles.printerMetaLine}>
                         <Text style={styles.metaDim}>Status: </Text>
-                        <Text style={[styles.metaValue, { color: statusColor }]}>
-                          {(info.status || 'unbekannt').toUpperCase()}
+                        <Text style={[styles.metaValue, { color: statusDisplay.color }]}>
+                          {statusDisplay.text}
                         </Text>
                         {info.labelLength != null && (
-                          <Text style={styles.metaDim}> • Länge: {info.labelLength}</Text>
+                          <Text style={styles.metaDim}> • Länge: {info.labelLength} Dots</Text>
                         )}
                       </Text>
                       <Text style={styles.printerMetaLine}>
@@ -510,6 +545,11 @@ export default function App(): React.JSX.Element {
                         <Text style={styles.metaDim}> | Seriennr.: </Text>
                         <Text style={styles.metaAccent}>{info.serial || '-'}</Text>
                       </Text>
+                      {statusDisplay.errorAlert && (
+                        <Text style={styles.printerAlertText}>
+                          {statusDisplay.errorAlert}
+                        </Text>
+                      )}
                     </View>
                   </View>
                 )}
@@ -980,6 +1020,12 @@ const styles = StyleSheet.create({
   metaAccent: {
     color: '#38bdf8',
     fontWeight: '600',
+  },
+  printerAlertText: {
+    color: '#fca5a5',
+    fontSize: 11,
+    fontWeight: '700',
+    marginTop: 3,
   },
   splitRow: {
     flexDirection: 'row',

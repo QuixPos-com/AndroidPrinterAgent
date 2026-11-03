@@ -159,6 +159,73 @@ object PrinterProtocol {
         }
     }
 
+    fun parseHostStatus(data: String): HostStatus {
+        val lines = data.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            .map { it.trim { c -> c == '\u0002' || c == '\u0003' || c == '\r' || c == '\n' || c == ' ' } }
+
+        var paperOut = false
+        var paused = false
+        var formatsInBuffer = 0
+        var headUp = false
+        var ribbonOut = false
+        var labelsRemaining = 0
+        var printingFormat = false
+
+        // 1. Try ~HS lines (f1 with >= 5 items, f2 with >= 10 items)
+        for (i in 0 until lines.size - 1) {
+            val f1 = lines[i].split(",")
+            val f2 = lines[i + 1].split(",")
+            if (f1.size >= 5 && f2.size >= 10 && f1[0].all { it.isDigit() } && f2[0].all { it.isDigit() }) {
+                paperOut = f1[1].trim() == "1"
+                paused = f1[2].trim() == "1"
+                formatsInBuffer = f1[4].trim().toIntOrNull() ?: 0
+                headUp = f2[2].trim() == "1"
+                ribbonOut = f2[3].trim() == "1"
+                labelsRemaining = f2[8].trim().toIntOrNull() ?: 0
+                printingFormat = f2[9].trim() == "1"
+                break
+            }
+        }
+
+        // 2. Supplement with ~HQES ERRORS:
+        for (line in lines) {
+            if (line.contains("ERRORS:")) {
+                val parts = line.split(Regex("\\s+"))
+                for (p in parts.drop(1)) {
+                    val clean = p.trim { c -> c == '\u0002' || c == '\u0003' || c == '\r' || c == '\n' || c == ' ' }
+                    val v = clean.toULongOrNull(16)
+                    if (v != null && v != 0UL) {
+                        if ((v and 0x04UL) != 0UL) headUp = true
+                        if ((v and 0x10000UL) != 0UL) paused = true
+                        if ((v and (0x04UL or 0x10000UL).inv()) != 0UL) paperOut = true
+                    }
+                }
+            }
+        }
+
+        // 3. Supplement with SGD head.latch
+        if (Regex("\"open\"", RegexOption.IGNORE_CASE).containsMatchIn(data) ||
+            data.contains("head.latch: open", ignoreCase = true)
+        ) {
+            headUp = true
+        }
+
+        // 4. Supplement with SGD device.pause
+        if (Regex("\"(yes|on)\"", RegexOption.IGNORE_CASE).containsMatchIn(data)) {
+            paused = true
+        }
+
+        return HostStatus(
+            paperOut = paperOut,
+            paused = paused,
+            headUp = headUp,
+            ribbonOut = ribbonOut,
+            formatsInBuffer = formatsInBuffer,
+            labelsRemaining = labelsRemaining,
+            printingFormat = printingFormat
+        )
+    }
+
     fun queryStatus(ip: String): HostStatus {
         printerLock.lock()
         try {
@@ -170,33 +237,42 @@ object PrinterProtocol {
                 socket.connect(InetSocketAddress(host, port), 5000)
                 socket.soTimeout = 5000
                 val out = socket.getOutputStream()
-                out.write("~HS".toByteArray(Charsets.UTF_8))
+                out.write("~HS~HQES".toByteArray(Charsets.UTF_8))
                 out.flush()
 
                 val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
-                val lines = Array(3) { "" }
-                for (i in 0..2) {
-                    val raw = reader.readLine() ?: throw Exception("reading ~HS line ${i + 1}: EOF")
-                    lines[i] = raw.trim { it == '\u0002' || it == '\u0003' || it == '\r' || it == '\n' || it == ' ' }
+                val sb = StringBuilder()
+                val buf = CharArray(1024)
+                val deadline = System.currentTimeMillis() + 3000L
+                while (System.currentTimeMillis() < deadline) {
+                    val n = try { reader.read(buf) } catch (_: Exception) { -1 }
+                    if (n > 0) {
+                        sb.append(buf, 0, n)
+                        if (sb.toString().split(",").size >= 12) break
+                    } else break
                 }
-                val f1 = lines[0].split(",")
-                val f2 = lines[1].split(",")
-                if (f1.size < 5 || f2.size < 10) {
-                    throw Exception("unexpected ~HS response ${lines.joinToString(" | ")}")
-                }
-                return HostStatus(
-                    paperOut = f1[1].trim() == "1",
-                    paused = f1[2].trim() == "1",
-                    formatsInBuffer = f1[4].trim().toIntOrNull() ?: 0,
-                    headUp = f2[2].trim() == "1",
-                    ribbonOut = f2[3].trim() == "1",
-                    labelsRemaining = f2[8].trim().toIntOrNull() ?: 0,
-                    printingFormat = f2[9].trim() == "1"
-                )
+                val raw = sb.toString()
+                if (raw.isBlank()) throw Exception("empty status response")
+                return parseHostStatus(raw)
             }
         } finally {
             printerLock.unlock()
         }
+    }
+
+    fun isValidModelName(name: String?): Boolean {
+        if (name.isNullOrBlank()) return false
+        val clean = name.trim().removePrefix("\"").removeSuffix("\"").trim()
+        if (clean.length < 2 || clean.length > 50) return false
+        // Must contain at least one letter and cannot be pure digits or status codes like "030"
+        if (!clean.any { it.isLetter() }) return false
+        if (clean.equals("unbekannt", ignoreCase = true) ||
+            clean.equals("unknown", ignoreCase = true) ||
+            clean.equals("Zebra BLE Printer", ignoreCase = true)
+        ) {
+            return false
+        }
+        return true
     }
 
     fun parsePrinterData(ip: String, data: String): PrinterInfo {
@@ -224,21 +300,49 @@ object PrinterProtocol {
             val token = rawToken.trim()
             if (token.contains(",") && !token.contains("ERRORS:") && !token.contains("WARNINGS:")) {
                 val parts = token.split(",")
+                // Skip ~HS status lines where parts are numeric (e.g. 030,0,0,0941,000...)
+                val isNumericStatusLine = parts.size >= 5 && parts[0].trim().all { it.isDigit() } && parts[1].trim().all { it.isDigit() }
+                if (isNumericStatusLine) {
+                    continue
+                }
+
                 if (parts.isNotEmpty() && model.isEmpty()) {
-                    var modelCandidate = parts[0].trim()
+                    var modelCandidate = parts[0].trim().removePrefix("\"").removeSuffix("\"").trim()
                     val qIdx = modelCandidate.lastIndexOf('"')
                     if (qIdx != -1) {
                         modelCandidate = modelCandidate.substring(qIdx + 1).trim()
                     }
-                    if (modelCandidate.isNotEmpty()) {
+                    if (isValidModelName(modelCandidate)) {
                         model = modelCandidate
                     }
                 }
                 if (parts.size >= 7 && serial.isEmpty()) {
                     val candidate = parts[6].trim().removePrefix("+")
                     val upper = candidate.uppercase()
-                    if (!upper.endsWith("KB") && !upper.endsWith("MB") && upper != "NONE") {
+                    if (!upper.endsWith("KB") && !upper.endsWith("MB") && upper != "NONE" && candidate.length in 6..24) {
                         serial = candidate
+                    }
+                }
+            }
+        }
+
+        // 2b. Parse Model from SGD getvar "device.product_name"
+        if (model.isEmpty()) {
+            for (chunk in normalized.split("\"")) {
+                val c = chunk.trim()
+                if (isValidModelName(c) && !c.contains("device.") && !c.contains("zpl.") && !c.contains("head.")) {
+                    if (c.startsWith("ZD", ignoreCase = true) ||
+                        c.startsWith("ZQ", ignoreCase = true) ||
+                        c.startsWith("ZT", ignoreCase = true) ||
+                        c.startsWith("GK", ignoreCase = true) ||
+                        c.startsWith("GX", ignoreCase = true) ||
+                        c.startsWith("QL", ignoreCase = true) ||
+                        c.startsWith("iMZ", ignoreCase = true) ||
+                        c.contains("ZTC", ignoreCase = true) ||
+                        c.contains("Zebra", ignoreCase = true)
+                    ) {
+                        model = c
+                        break
                     }
                 }
             }
@@ -303,15 +407,21 @@ object PrinterProtocol {
                 val upper = trimmed.uppercase()
                 if (upper.contains("MODEL") && !upper.contains("CLIENTMODEL")) {
                     if (trimmed.contains(":")) {
-                        model = trimmed.substringAfter(":").trim()
-                        break
+                        val cand = trimmed.substringAfter(":").trim()
+                        if (isValidModelName(cand)) {
+                            model = cand
+                            break
+                        }
                     }
                     val parts = trimmed.split(Regex("\\s+"))
                     if (parts.size > 1) {
                         val idx = parts.indexOfFirst { it.equals("MODEL", ignoreCase = true) }
                         if (idx > 0) {
-                            model = parts.subList(0, idx).joinToString(" ")
-                            break
+                            val cand = parts.subList(0, idx).joinToString(" ")
+                            if (isValidModelName(cand)) {
+                                model = cand
+                                break
+                            }
                         }
                     }
                 }
@@ -321,7 +431,7 @@ object PrinterProtocol {
         if (model.isEmpty()) {
             for (line in lines) {
                 val trimmed = line.trim()
-                if (trimmed.startsWith("ZTC ") || trimmed.startsWith("Zebra ")) {
+                if ((trimmed.startsWith("ZTC ") || trimmed.startsWith("Zebra ")) && isValidModelName(trimmed)) {
                     model = trimmed
                     break
                 }
@@ -377,6 +487,61 @@ object PrinterProtocol {
                     }
                 }
             }
+        }
+
+        // 6b. Parse from ~HS (Host Status)
+        val hsTokens = lines.map { it.trim { c -> c == '\u0002' || c == '\u0003' || c == '\r' || c == '\n' || c == ' ' } }
+        for (i in 0 until hsTokens.size - 1) {
+            val f1 = hsTokens[i].split(",")
+            val f2 = hsTokens[i + 1].split(",")
+            if (f1.size >= 5 && f2.size >= 10 && f1[0].all { it.isDigit() } && f2[0].all { it.isDigit() }) {
+                errorsParsed = true
+                if (f1[1].trim() == "1") {
+                    other = true
+                    hasError = true
+                }
+                if (f1[2].trim() == "1") {
+                    pause = true
+                    hasError = true
+                }
+                if (f2[2].trim() == "1") {
+                    headOpen = true
+                    hasError = true
+                }
+                if (f2[3].trim() == "1") {
+                    other = true
+                    hasError = true
+                }
+                break
+            }
+        }
+
+        // 6c. Parse from SGD "head.latch" (returns "open" or "ok")
+        if (Regex("\"open\"", RegexOption.IGNORE_CASE).containsMatchIn(normalized) ||
+            normalized.contains("head.latch: open", ignoreCase = true)
+        ) {
+            headOpen = true
+            hasError = true
+            errorsParsed = true
+        } else if (Regex("\"ok\"", RegexOption.IGNORE_CASE).containsMatchIn(normalized) ||
+            normalized.contains("head.latch: ok", ignoreCase = true)
+        ) {
+            if (!errorsParsed) {
+                errorsParsed = true
+            }
+        }
+
+        // 6d. Parse from SGD "device.pause" (returns "yes" or "no" or "1" / "0")
+        if (Regex("\"(yes|on)\"", RegexOption.IGNORE_CASE).containsMatchIn(normalized)) {
+            pause = true
+            hasError = true
+            errorsParsed = true
+        }
+
+        // 6e. If printer responded with valid identification/configuration but no error was flagged, consider it online
+        if (!errorsParsed && (serial.isNotEmpty() || model.isNotEmpty() || labelLength != null)) {
+            errorsParsed = true
+            hasError = false
         }
 
         val ready: Boolean
