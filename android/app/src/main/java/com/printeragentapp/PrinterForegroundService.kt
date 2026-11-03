@@ -124,10 +124,10 @@ class PrinterForegroundService : Service(), AgentEngine.AgentListener {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "Zebra Printer Agent Status",
+                "QuixPos Drucker-Agent Status",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Displays real-time connection and connected ZPL printers status in the notification bar"
+                description = "Zeigt den Echtzeit-Verbindungsstatus und verbundene Drucker in der Benachrichtigungsleiste an"
                 setShowBadge(false)
             }
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -178,8 +178,8 @@ class PrinterForegroundService : Service(), AgentEngine.AgentListener {
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setContentIntent(pendingOpen)
-            .addAction(0, "Reconnect", pendingReload)
-            .addAction(0, "Stop Agent", pendingStop)
+            .addAction(0, "Neu verbinden", pendingReload)
+            .addAction(0, "Agent stoppen", pendingStop)
             .build()
     }
 

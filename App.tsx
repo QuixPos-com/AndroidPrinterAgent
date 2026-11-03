@@ -101,7 +101,7 @@ export default function App(): React.JSX.Element {
         setLogs(initialLogs.slice(-300));
       }
     } catch (e: any) {
-      showToast(`Init error: ${e?.message || String(e)}`, 'error');
+      showToast(`Initialisierungsfehler: ${e?.message || String(e)}`, 'error');
     }
   }, [applySnapshot, showToast]);
 
@@ -146,7 +146,7 @@ export default function App(): React.JSX.Element {
   const handleSaveConfig = async () => {
     const cleanApi = apiUrl.trim();
     if (!cleanApi) {
-      showToast('QuixPOS API URL is required', 'error');
+      showToast('QuixPOS-API-URL ist erforderlich', 'error');
       return;
     }
     const cleanPrinters = printerRows.map(r => r.trim()).filter(Boolean);
@@ -167,16 +167,16 @@ export default function App(): React.JSX.Element {
       }
       const snap = await PrinterAgent.saveConfig(cleanApi, cleanPrinters, port.trim() || '41783');
       applySnapshot(snap);
-      showToast('Configuration saved & printers reconnected!');
+      showToast('Konfiguration gespeichert & Drucker neu verbunden!');
     } catch (e: any) {
-      showToast(`Save error: ${e?.message || String(e)}`, 'error');
+      showToast(`Fehler beim Speichern: ${e?.message || String(e)}`, 'error');
     }
   };
 
   const handlePair = async () => {
     const pin = pairPin.trim();
     if (!pin) {
-      showToast('Please enter 6-digit pairing PIN', 'error');
+      showToast('Bitte 6-stellige Kopplungs-PIN eingeben', 'error');
       return;
     }
     setIsPairing(true);
@@ -185,9 +185,9 @@ export default function App(): React.JSX.Element {
       setPairPin('');
       setIsPaired(true);
       setAgentName(res.name || 'android-agent');
-      showToast(`Paired successfully as "${res.name || 'agent'}"!`);
+      showToast(`Erfolgreich gekoppelt als „${res.name || 'Agent'}“!`);
     } catch (e: any) {
-      showToast(`Pairing failed: ${e?.message || String(e)}`, 'error');
+      showToast(`Kopplung fehlgeschlagen: ${e?.message || String(e)}`, 'error');
     } finally {
       setIsPairing(false);
     }
@@ -199,9 +199,9 @@ export default function App(): React.JSX.Element {
       setIsPaired(false);
       setAgentName('');
       setBackendConnected(false);
-      showToast('Agent unpaired (token cleared & stream dropped)');
+      showToast('Agent getrennt (Token gelöscht & Verbindung beendet)');
     } catch (e: any) {
-      showToast(`Unpair error: ${e?.message || String(e)}`, 'error');
+      showToast(`Fehler beim Entkoppeln: ${e?.message || String(e)}`, 'error');
     }
   };
 
@@ -211,7 +211,7 @@ export default function App(): React.JSX.Element {
       await PrinterAgent.requestBluetoothPermissions();
       const found = await PrinterAgent.scanLocalPrinters();
       if (!Array.isArray(found) || found.length === 0) {
-        showToast('No ZPL printers found (BLE or TCP 9100)', 'error');
+        showToast('Keine Drucker gefunden (BLE oder TCP 9100)', 'error');
         setDiscoveredPrinters([]);
         setShowDiscovered(false);
         return;
@@ -227,15 +227,15 @@ export default function App(): React.JSX.Element {
 
       if (found.length === 1) {
         selectDiscoveredPrinter(found[0]);
-        showToast(`Found ${found[0].model || 'ZPL Printer'} at ${found[0].ip}`);
+        showToast(`${found[0].model || 'Drucker'} unter ${found[0].ip} gefunden`);
         setShowDiscovered(false);
       } else {
         setDiscoveredPrinters(found);
         setShowDiscovered(true);
-        showToast(`Found ${found.length} ZPL printers (BLE / TCP)`);
+        showToast(`${found.length} Drucker gefunden (BLE / TCP)`);
       }
     } catch (e: any) {
-      showToast(`Scan failed: ${e?.message || String(e)}`, 'error');
+      showToast(`Suchlauf fehlgeschlagen: ${e?.message || String(e)}`, 'error');
     } finally {
       setIsScanning(false);
     }
@@ -301,16 +301,16 @@ export default function App(): React.JSX.Element {
         await PrinterAgent.stopForegroundService();
         setIsForegroundNotif(false);
         setIsRunning(false);
-        showToast('Stopped background notification bar service');
+        showToast('Hintergrund-Statusleistendienst gestoppt');
       } else {
         await PrinterAgent.requestNotificationPermission();
         await PrinterAgent.startForegroundService();
         setIsForegroundNotif(true);
         setIsRunning(true);
-        showToast('Started background notification bar service');
+        showToast('Hintergrund-Statusleistendienst gestartet');
       }
     } catch (e: any) {
-      showToast(`Service error: ${e?.message || String(e)}`, 'error');
+      showToast(`Dienstfehler: ${e?.message || String(e)}`, 'error');
     }
   };
 
@@ -334,10 +334,10 @@ export default function App(): React.JSX.Element {
       <View style={styles.header}>
         <View style={styles.headerBrand}>
           <View style={styles.headerIcon}>
-            <Text style={styles.headerIconText}>QZ</Text>
+            <Text style={styles.headerIconText}>QP</Text>
           </View>
           <View>
-            <Text style={styles.headerTitle}>Zebra Agent Manager</Text>
+            <Text style={styles.headerTitle}>QuixPosPrinterAgent</Text>
           </View>
         </View>
         <View
@@ -368,7 +368,7 @@ export default function App(): React.JSX.Element {
                   ? styles.textWarning
                   : styles.textOffline,
             ]}>
-            {backendConnected ? 'SSE ONLINE' : isPaired ? 'CONNECTING' : 'UNPAIRED'}
+            {backendConnected ? 'ONLINE' : isPaired ? 'VERBINDUNG...' : 'NICHT GEKOPPELT'}
           </Text>
         </View>
       </View>
@@ -376,9 +376,9 @@ export default function App(): React.JSX.Element {
       <ScrollView style={styles.scrollArea} contentContainerStyle={styles.scrollContent}>
         {/* Card 1: Connection Settings (API URL & Local Port) */}
         <View style={styles.card}>
-          <Text style={styles.cardTitle}>CONNECTION SETTINGS</Text>
+          <Text style={styles.cardTitle}>VERBINDUNGSEINSTELLUNGEN</Text>
           <View style={styles.formGroup}>
-            <Text style={styles.label}>QUIXPOS API URL</Text>
+            <Text style={styles.label}>QUIXPOS API-URL</Text>
             <TextInput
               style={styles.input}
               value={apiUrl}
@@ -390,7 +390,7 @@ export default function App(): React.JSX.Element {
             />
           </View>
           <View style={styles.formGroup}>
-            <Text style={styles.label}>LOCAL SERVICE PORT</Text>
+            <Text style={styles.label}>LOKALER SERVICE-PORT</Text>
             <TextInput
               style={styles.input}
               value={port}
@@ -401,14 +401,14 @@ export default function App(): React.JSX.Element {
             />
           </View>
           <TouchableOpacity style={styles.btnPrimary} onPress={handleSaveConfig}>
-            <Text style={styles.btnPrimaryText}>💾 Save Connection Settings</Text>
+            <Text style={styles.btnPrimaryText}>💾 Verbindungseinstellungen speichern</Text>
           </TouchableOpacity>
         </View>
 
         {/* Card 2: ZPL Printers (Add IPs / BLE, Scan TCP 9100 & BLE, Live Status) */}
         <View style={styles.card}>
           <View style={styles.cardHeaderRow}>
-            <Text style={styles.cardTitle}>ZPL PRINTERS (TCP & BLE)</Text>
+            <Text style={styles.cardTitle}>DRUCKER (TCP & BLE)</Text>
             <View style={styles.rowActions}>
               <TouchableOpacity
                 style={[styles.btnSecondarySm, isScanning && styles.btnDisabled]}
@@ -417,17 +417,17 @@ export default function App(): React.JSX.Element {
                 {isScanning ? (
                   <View style={styles.scanningRow}>
                     <ActivityIndicator size="small" color="#38bdf8" />
-                    <Text style={styles.btnSecondaryText}> Scanning...</Text>
+                    <Text style={styles.btnSecondaryText}> Sucht...</Text>
                   </View>
                 ) : (
-                  <Text style={styles.btnSecondaryText}>🔍 Scan</Text>
+                  <Text style={styles.btnSecondaryText}>🔍 Suchen</Text>
                 )}
               </TouchableOpacity>
               <TouchableOpacity style={styles.btnOutlineSm} onPress={handleAddBleAutoRow}>
                 <Text style={styles.btnOutlineText}>+ BLE</Text>
               </TouchableOpacity>
               <TouchableOpacity style={styles.btnOutlineSm} onPress={handleAddPrinterRow}>
-                <Text style={styles.btnOutlineText}>+ Add</Text>
+                <Text style={styles.btnOutlineText}>+ Hinzufügen</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -437,7 +437,7 @@ export default function App(): React.JSX.Element {
             <View style={styles.discoveredBox}>
               <View style={styles.discoveredHeader}>
                 <Text style={styles.discoveredHeaderText}>
-                  Discovered ({discoveredPrinters.length}): tap to add
+                  Gefunden ({discoveredPrinters.length}): Zum Hinzufügen tippen
                 </Text>
                 <TouchableOpacity onPress={() => setShowDiscovered(false)}>
                   <Text style={styles.closeBtnText}>✕</Text>
@@ -449,11 +449,11 @@ export default function App(): React.JSX.Element {
                   style={styles.discoveredItem}
                   onPress={() => {
                     selectDiscoveredPrinter(p);
-                    showToast(`Added ${p.ip} (${p.model || 'ZPL'})`);
+                    showToast(`${p.ip} (${p.model || 'Drucker'}) hinzugefügt`);
                   }}>
                   <View style={styles.discoveredItemTop}>
                     <Text style={styles.discoveredIp}>{p.ip}</Text>
-                    <Text style={styles.discoveredModel}>{p.model || 'ZPL Printer'}</Text>
+                    <Text style={styles.discoveredModel}>{p.model || 'Drucker'}</Text>
                   </View>
                   {!!p.serial && <Text style={styles.discoveredSerial}>SN: {p.serial}</Text>}
                 </TouchableOpacity>
@@ -479,7 +479,7 @@ export default function App(): React.JSX.Element {
                     style={[styles.input, styles.printerInput]}
                     value={ipVal}
                     onChangeText={val => handleUpdatePrinterRow(idx, val)}
-                    placeholder="e.g. 192.168.1.100 or ble or ble:34:14:B5:..."
+                    placeholder="z. B. 192.168.1.100 oder ble oder ble:34:14:B5:..."
                     placeholderTextColor="#64748b"
                     autoCapitalize="none"
                     autoCorrect={false}
@@ -498,16 +498,16 @@ export default function App(): React.JSX.Element {
                       <Text style={styles.printerMetaLine}>
                         <Text style={styles.metaDim}>Status: </Text>
                         <Text style={[styles.metaValue, { color: statusColor }]}>
-                          {(info.status || 'unknown').toUpperCase()}
+                          {(info.status || 'unbekannt').toUpperCase()}
                         </Text>
                         {info.labelLength != null && (
-                          <Text style={styles.metaDim}> • Length: {info.labelLength}</Text>
+                          <Text style={styles.metaDim}> • Länge: {info.labelLength}</Text>
                         )}
                       </Text>
                       <Text style={styles.printerMetaLine}>
-                        <Text style={styles.metaDim}>Model: </Text>
+                        <Text style={styles.metaDim}>Modell: </Text>
                         <Text style={styles.metaValue}>{info.model || '-'}</Text>
-                        <Text style={styles.metaDim}> | Serial: </Text>
+                        <Text style={styles.metaDim}> | Seriennr.: </Text>
                         <Text style={styles.metaAccent}>{info.serial || '-'}</Text>
                       </Text>
                     </View>
@@ -518,7 +518,7 @@ export default function App(): React.JSX.Element {
           })}
 
           <TouchableOpacity style={styles.btnPrimary} onPress={handleSaveConfig}>
-            <Text style={styles.btnPrimaryText}>💾 Save Printers</Text>
+            <Text style={styles.btnPrimaryText}>💾 Drucker speichern</Text>
           </TouchableOpacity>
         </View>
 
@@ -526,9 +526,9 @@ export default function App(): React.JSX.Element {
         <View style={styles.splitRow}>
           {/* Pairing Card */}
           <View style={[styles.card, styles.halfCard]}>
-            <Text style={styles.cardTitle}>PAIRING</Text>
+            <Text style={styles.cardTitle}>KOPPLUNG</Text>
             <View style={styles.statusRowBox}>
-              <Text style={styles.statusRowLabel}>Paired:</Text>
+              <Text style={styles.statusRowLabel}>Gekoppelt:</Text>
               <View
                 style={[
                   styles.statusPillSm,
@@ -540,7 +540,7 @@ export default function App(): React.JSX.Element {
                     isPaired ? styles.textOnline : styles.textOffline,
                   ]}
                   numberOfLines={1}>
-                  {isPaired ? `YES (${agentName || 'agent'})` : 'NO'}
+                  {isPaired ? `JA (${agentName || 'Agent'})` : 'NEIN'}
                 </Text>
               </View>
             </View>
@@ -551,7 +551,7 @@ export default function App(): React.JSX.Element {
                   style={[styles.input, styles.pinInput]}
                   value={pairPin}
                   onChangeText={setPairPin}
-                  placeholder="6-digit PIN"
+                  placeholder="6-stellige PIN"
                   placeholderTextColor="#64748b"
                   autoCapitalize="characters"
                 />
@@ -559,21 +559,21 @@ export default function App(): React.JSX.Element {
                   style={[styles.btnPair, isPairing && styles.btnDisabled]}
                   onPress={handlePair}
                   disabled={isPairing}>
-                  <Text style={styles.btnPrimaryText}>{isPairing ? '...' : 'Pair'}</Text>
+                  <Text style={styles.btnPrimaryText}>{isPairing ? '...' : 'Koppeln'}</Text>
                 </TouchableOpacity>
               </View>
             ) : (
               <TouchableOpacity style={styles.btnDanger} onPress={handleUnpair}>
-                <Text style={styles.btnDangerText}>Unpair Agent</Text>
+                <Text style={styles.btnDangerText}>Agent trennen</Text>
               </TouchableOpacity>
             )}
           </View>
 
           {/* Foreground Notification Bar Service Card */}
           <View style={[styles.card, styles.halfCard]}>
-            <Text style={styles.cardTitle}>NOTIFICATION SERVICE</Text>
+            <Text style={styles.cardTitle}>BENACHRICHTIGUNGSDIENST</Text>
             <View style={styles.statusRowBox}>
-              <Text style={styles.statusRowLabel}>Running:</Text>
+              <Text style={styles.statusRowLabel}>Aktiv:</Text>
               <View
                 style={[
                   styles.statusPillSm,
@@ -584,12 +584,12 @@ export default function App(): React.JSX.Element {
                     styles.statusPillTextSm,
                     isRunning ? styles.textOnline : styles.textOffline,
                   ]}>
-                  {isRunning ? 'YES' : 'NO'}
+                  {isRunning ? 'JA' : 'NEIN'}
                 </Text>
               </View>
             </View>
             <View style={styles.statusRowBox}>
-              <Text style={styles.statusRowLabel}>Status Bar:</Text>
+              <Text style={styles.statusRowLabel}>Statusleiste:</Text>
               <View
                 style={[
                   styles.statusPillSm,
@@ -600,7 +600,7 @@ export default function App(): React.JSX.Element {
                     styles.statusPillTextSm,
                     isForegroundNotif ? styles.textOnline : styles.textOffline,
                   ]}>
-                  {isForegroundNotif ? 'ACTIVE' : 'OFF'}
+                  {isForegroundNotif ? 'AKTIV' : 'AUS'}
                 </Text>
               </View>
             </View>
@@ -609,7 +609,7 @@ export default function App(): React.JSX.Element {
               style={isForegroundNotif ? styles.btnDanger : styles.btnPrimary}
               onPress={handleToggleForegroundService}>
               <Text style={isForegroundNotif ? styles.btnDangerText : styles.btnPrimaryText}>
-                {isForegroundNotif ? 'Stop Bar Service' : 'Start Bar Service'}
+                {isForegroundNotif ? 'Dienst stoppen' : 'Dienst starten'}
               </Text>
             </TouchableOpacity>
           </View>
@@ -618,9 +618,9 @@ export default function App(): React.JSX.Element {
         {/* Card 4: Live Agent Log Terminal */}
         <View style={[styles.card, styles.logCard]}>
           <View style={styles.cardHeaderRow}>
-            <Text style={styles.cardTitle}>LIVE AGENT LOGS ({logs.length})</Text>
+            <Text style={styles.cardTitle}>LIVE-AGENT-PROTOKOLL ({logs.length})</Text>
             <TouchableOpacity style={styles.btnSecondarySm} onPress={handleClearLogs}>
-              <Text style={styles.btnSecondaryText}>🗑️ Clear</Text>
+              <Text style={styles.btnSecondaryText}>🗑️ Leeren</Text>
             </TouchableOpacity>
           </View>
 
@@ -630,7 +630,7 @@ export default function App(): React.JSX.Element {
             nestedScrollEnabled
             onContentSizeChange={() => logScrollRef.current?.scrollToEnd({ animated: true })}>
             {logs.length === 0 ? (
-              <Text style={styles.logEmpty}>Waiting for agent output...</Text>
+              <Text style={styles.logEmpty}>Warte auf Agent-Ausgabe...</Text>
             ) : (
               logs.map((line, i) => {
                 let color = '#cbd5e1';

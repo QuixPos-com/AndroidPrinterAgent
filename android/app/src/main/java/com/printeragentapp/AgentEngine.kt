@@ -577,17 +577,17 @@ class AgentEngine private constructor(private val appContext: Context) {
         val snap = getSnapshot()
         val isPairedNow = snap.optBoolean("paired", false)
         val isBackendConn = snap.optBoolean("backendConnected", false)
-        val agentLabel = snap.optString("agentName", "").ifEmpty { "Unpaired" }
+        val agentLabel = snap.optString("agentName", "").ifEmpty { "Nicht gekoppelt" }
         val printersArr = snap.optJSONArray("printers") ?: JSONArray()
 
         val title = when {
-            !isPairedNow -> "Zebra Agent • Unpaired"
-            isBackendConn -> "Zebra Agent • Connected ($agentLabel)"
-            else -> "Zebra Agent • Reconnecting ($agentLabel)"
+            !isPairedNow -> "QuixPos Agent • Nicht gekoppelt"
+            isBackendConn -> "QuixPos Agent • Verbunden ($agentLabel)"
+            else -> "QuixPos Agent • Verbindungsaufbau ($agentLabel)"
         }
 
         if (printersArr.length() == 0) {
-            return Pair(title, "No ZPL printers configured")
+            return Pair(title, "Keine Drucker konfiguriert")
         }
 
         var onlineCount = 0
@@ -603,7 +603,7 @@ class AgentEngine private constructor(private val appContext: Context) {
             parts.add("$label: ${status.uppercase()}")
         }
 
-        val summary = "Printers ($onlineCount/${printersArr.length()} online): ${parts.joinToString(" • ")}"
+        val summary = "Drucker ($onlineCount/${printersArr.length()} online): ${parts.joinToString(" • ")}"
         return Pair(title, summary)
     }
 
