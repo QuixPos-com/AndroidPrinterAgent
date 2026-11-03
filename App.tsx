@@ -150,7 +150,21 @@ export default function App(): React.JSX.Element {
       return;
     }
     const cleanPrinters = printerRows.map(r => r.trim()).filter(Boolean);
+    const hasBle = cleanPrinters.some(p => {
+      const l = p.toLowerCase();
+      return (
+        l === 'ble' ||
+        l === 'bluetooth' ||
+        l === 'auto' ||
+        l.startsWith('ble:') ||
+        l.startsWith('bt:') ||
+        /^([0-9a-f]{2}[:-]){5}[0-9a-f]{2}$/i.test(l)
+      );
+    });
     try {
+      if (hasBle) {
+        await PrinterAgent.requestBluetoothPermissions();
+      }
       const snap = await PrinterAgent.saveConfig(cleanApi, cleanPrinters, port.trim() || '41783');
       applySnapshot(snap);
       showToast('Configuration saved & printers reconnected!');
@@ -194,9 +208,10 @@ export default function App(): React.JSX.Element {
   const handleScanPrinters = async () => {
     setIsScanning(true);
     try {
+      await PrinterAgent.requestBluetoothPermissions();
       const found = await PrinterAgent.scanLocalPrinters();
       if (!Array.isArray(found) || found.length === 0) {
-        showToast('No ZPL printers found on local network (TCP 9100)', 'error');
+        showToast('No ZPL printers found (BLE or TCP 9100)', 'error');
         setDiscoveredPrinters([]);
         setShowDiscovered(false);
         return;
@@ -217,7 +232,7 @@ export default function App(): React.JSX.Element {
       } else {
         setDiscoveredPrinters(found);
         setShowDiscovered(true);
-        showToast(`Found ${found.length} ZPL printers on local network`);
+        showToast(`Found ${found.length} ZPL printers (BLE / TCP)`);
       }
     } catch (e: any) {
       showToast(`Scan failed: ${e?.message || String(e)}`, 'error');
@@ -245,6 +260,24 @@ export default function App(): React.JSX.Element {
 
   const handleAddPrinterRow = () => {
     setPrinterRows(prev => [...prev, '']);
+  };
+
+  const handleAddBleAutoRow = async () => {
+    try {
+      await PrinterAgent.requestBluetoothPermissions();
+    } catch {}
+    setPrinterRows(prev => {
+      if (prev.some(r => r.trim().toLowerCase() === 'ble')) {
+        return prev;
+      }
+      const emptyIdx = prev.findIndex(r => r.trim() === '');
+      if (emptyIdx !== -1) {
+        const copy = [...prev];
+        copy[emptyIdx] = 'ble';
+        return copy;
+      }
+      return [...prev, 'ble'];
+    });
   };
 
   const handleUpdatePrinterRow = (index: number, value: string) => {
@@ -372,10 +405,10 @@ export default function App(): React.JSX.Element {
           </TouchableOpacity>
         </View>
 
-        {/* Card 2: ZPL Printers (Add IPs, Scan TCP 9100, Live Status) */}
+        {/* Card 2: ZPL Printers (Add IPs / BLE, Scan TCP 9100 & BLE, Live Status) */}
         <View style={styles.card}>
           <View style={styles.cardHeaderRow}>
-            <Text style={styles.cardTitle}>ZPL PRINTERS (TCP 9100)</Text>
+            <Text style={styles.cardTitle}>ZPL PRINTERS (TCP & BLE)</Text>
             <View style={styles.rowActions}>
               <TouchableOpacity
                 style={[styles.btnSecondarySm, isScanning && styles.btnDisabled]}
@@ -389,6 +422,9 @@ export default function App(): React.JSX.Element {
                 ) : (
                   <Text style={styles.btnSecondaryText}>🔍 Scan</Text>
                 )}
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.btnOutlineSm} onPress={handleAddBleAutoRow}>
+                <Text style={styles.btnOutlineText}>+ BLE</Text>
               </TouchableOpacity>
               <TouchableOpacity style={styles.btnOutlineSm} onPress={handleAddPrinterRow}>
                 <Text style={styles.btnOutlineText}>+ Add</Text>
@@ -443,7 +479,7 @@ export default function App(): React.JSX.Element {
                     style={[styles.input, styles.printerInput]}
                     value={ipVal}
                     onChangeText={val => handleUpdatePrinterRow(idx, val)}
-                    placeholder="e.g. 192.168.1.100"
+                    placeholder="e.g. 192.168.1.100 or ble or ble:34:14:B5:..."
                     placeholderTextColor="#64748b"
                     autoCapitalize="none"
                     autoCorrect={false}

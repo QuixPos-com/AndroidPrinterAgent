@@ -40,9 +40,9 @@ object PrinterProtocol {
     fun isValidPrinterTarget(target: String): Boolean {
         val clean = target.trim()
         if (clean.isEmpty()) return false
+        if (BlePrinterManager.isBluetoothTarget(clean)) return true
         val lower = clean.lowercase()
-        if (lower == "ble" || lower == "bluetooth" || lower == "auto" || lower == "usb") return true
-        if (lower.startsWith("ble:") || lower.startsWith("bt:") || lower.startsWith("usb:")) return true
+        if (lower == "usb" || lower.startsWith("usb:")) return true
         // IPv4 check
         val parts = clean.split(".")
         if (parts.size == 4 && parts.all { it.toIntOrNull() in 0..255 }) {
@@ -92,6 +92,9 @@ object PrinterProtocol {
             errors = PrinterErrors(unreachable = true)
         )
         if (ip.isBlank()) return offlineInfo
+        if (BlePrinterManager.isBluetoothTarget(ip)) {
+            return BlePrinterManager.queryPrinterInfoLocked(ip)
+        }
 
         val (host, port) = parseHostPort(ip)
         return try {
@@ -139,6 +142,10 @@ object PrinterProtocol {
     fun sendZPL(ip: String, zpl: String) {
         printerLock.lock()
         try {
+            if (BlePrinterManager.isBluetoothTarget(ip)) {
+                BlePrinterManager.sendZPLLocked(ip, zpl)
+                return
+            }
             val (host, port) = parseHostPort(ip)
             Socket().use { socket ->
                 socket.connect(InetSocketAddress(host, port), 5000)
@@ -155,6 +162,9 @@ object PrinterProtocol {
     fun queryStatus(ip: String): HostStatus {
         printerLock.lock()
         try {
+            if (BlePrinterManager.isBluetoothTarget(ip)) {
+                return BlePrinterManager.queryStatusLocked(ip)
+            }
             val (host, port) = parseHostPort(ip)
             Socket().use { socket ->
                 socket.connect(InetSocketAddress(host, port), 5000)
@@ -479,40 +489,57 @@ object PrinterProtocol {
     }
 
     fun scanLocalZPLPrinters(): List<PrinterInfo> {
-        val prefixes = localIPv4Prefixes()
-        if (prefixes.isEmpty()) return emptyList()
-
-        val candidateIPs = ArrayList<String>()
-        for (p in prefixes) {
-            for (host in 1..254) {
-                candidateIPs.add("$p.$host")
+        val bleResults = Collections.synchronizedList(ArrayList<PrinterInfo>())
+        val bleThread = Thread({
+            try {
+                bleResults.addAll(BlePrinterManager.scanBLEPrinters())
+            } catch (_: Exception) {
             }
+        }, "ZebraBleScan").apply {
+            isDaemon = true
+            start()
         }
 
+        val prefixes = localIPv4Prefixes()
         val found = Collections.synchronizedList(ArrayList<PrinterInfo>())
-        val sem = Semaphore(64)
-        val pool = Executors.newFixedThreadPool(64)
 
-        try {
-            val tasks = candidateIPs.map { ip ->
-                Callable {
-                    sem.acquire()
-                    try {
-                        val info = probeZPLPrinter(ip)
-                        if (info != null) {
-                            found.add(info)
-                        }
-                    } finally {
-                        sem.release()
-                    }
+        if (prefixes.isNotEmpty()) {
+            val candidateIPs = ArrayList<String>()
+            for (p in prefixes) {
+                for (host in 1..254) {
+                    candidateIPs.add("$p.$host")
                 }
             }
-            pool.invokeAll(tasks, 15, TimeUnit.SECONDS)
-        } catch (_: Exception) {
-        } finally {
-            pool.shutdownNow()
+
+            val sem = Semaphore(64)
+            val pool = Executors.newFixedThreadPool(64)
+
+            try {
+                val tasks = candidateIPs.map { ip ->
+                    Callable {
+                        sem.acquire()
+                        try {
+                            val info = probeZPLPrinter(ip)
+                            if (info != null) {
+                                found.add(info)
+                            }
+                        } finally {
+                            sem.release()
+                        }
+                    }
+                }
+                pool.invokeAll(tasks, 15, TimeUnit.SECONDS)
+            } catch (_: Exception) {
+            } finally {
+                pool.shutdownNow()
+            }
         }
 
-        return found.sortedBy { it.ip }
+        try {
+            bleThread.join(10_000)
+        } catch (_: InterruptedException) {
+        }
+
+        return bleResults + found.sortedBy { it.ip }
     }
 }

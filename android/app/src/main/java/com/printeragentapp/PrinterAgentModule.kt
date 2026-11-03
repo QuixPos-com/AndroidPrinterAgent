@@ -80,22 +80,55 @@ class PrinterAgentModule(private val reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun requestNotificationPermission(promise: Promise) {
+        val needed = ArrayList<String>()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val activity = reactContext.currentActivity
-            val granted = ContextCompat.checkSelfPermission(
-                reactContext,
-                Manifest.permission.POST_NOTIFICATIONS
-            ) == PackageManager.PERMISSION_GRANTED
-            if (!granted && activity != null) {
-                ActivityCompat.requestPermissions(
-                    activity,
-                    arrayOf(Manifest.permission.POST_NOTIFICATIONS),
-                    1001
-                )
+            if (ContextCompat.checkSelfPermission(reactContext, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.POST_NOTIFICATIONS)
             }
-            promise.resolve(granted)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (ContextCompat.checkSelfPermission(reactContext, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.BLUETOOTH_SCAN)
+            }
+            if (ContextCompat.checkSelfPermission(reactContext, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.BLUETOOTH_CONNECT)
+            }
         } else {
-            promise.resolve(true)
+            if (ContextCompat.checkSelfPermission(reactContext, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
+            }
+        }
+
+        val activity = reactContext.currentActivity
+        if (needed.isNotEmpty() && activity != null) {
+            ActivityCompat.requestPermissions(activity, needed.toTypedArray(), 1001)
+            promise.resolve(false)
+        } else {
+            promise.resolve(needed.isEmpty())
+        }
+    }
+
+    @ReactMethod
+    fun requestBluetoothPermissions(promise: Promise) {
+        val needed = ArrayList<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (ContextCompat.checkSelfPermission(reactContext, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.BLUETOOTH_SCAN)
+            }
+            if (ContextCompat.checkSelfPermission(reactContext, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.BLUETOOTH_CONNECT)
+            }
+        } else {
+            if (ContextCompat.checkSelfPermission(reactContext, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
+            }
+        }
+        val activity = reactContext.currentActivity
+        if (needed.isNotEmpty() && activity != null) {
+            ActivityCompat.requestPermissions(activity, needed.toTypedArray(), 1002)
+            promise.resolve(false)
+        } else {
+            promise.resolve(needed.isEmpty())
         }
     }
 

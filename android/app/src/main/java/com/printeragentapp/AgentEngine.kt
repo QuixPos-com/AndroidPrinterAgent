@@ -89,6 +89,10 @@ class AgentEngine private constructor(private val appContext: Context) {
     private val currentStreamConn = AtomicReference<HttpURLConnection?>(null)
     private val workerReset = AtomicBoolean(false)
 
+    init {
+        BlePrinterManager.init(appContext)
+    }
+
     fun addListener(listener: AgentListener) {
         if (!listeners.contains(listener)) {
             listeners.add(listener)
@@ -206,6 +210,7 @@ class AgentEngine private constructor(private val appContext: Context) {
         }
         logf("ZebraAgent shutting down...")
         currentStreamConn.getAndSet(null)?.disconnect()
+        BlePrinterManager.disconnect()
         synchronized(streamSignal) { streamSignal.notifyAll() }
         synchronized(printerPollSignal) { printerPollSignal.notifyAll() }
         monitorServer?.stop()
@@ -361,6 +366,7 @@ class AgentEngine private constructor(private val appContext: Context) {
     }
 
     fun reconnectPrinters() {
+        BlePrinterManager.disconnect()
         mu.lock()
         lastPrinterInfo = PrinterInfo(
             ip = cfg.printerIp,
@@ -489,12 +495,12 @@ class AgentEngine private constructor(private val appContext: Context) {
     }
 
     fun scanPrinters(): List<PrinterInfo> {
-        logf("Scanning local network for ZPL printers on TCP port 9100...")
+        logf("Scanning for ZPL printers (BLE & TCP port 9100)...")
         val found = PrinterProtocol.scanLocalZPLPrinters()
         for (p in found) {
             printersInfo[p.ip] = p
         }
-        logf("Network scan complete: found ${found.size} ZPL printer(s)")
+        logf("Scan complete: found ${found.size} ZPL printer(s)")
         notifyStateChanged()
         return found
     }

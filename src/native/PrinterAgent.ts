@@ -57,6 +57,7 @@ export interface ServiceStatus {
 
 interface PrinterAgentNativeModule {
   requestNotificationPermission(): Promise<boolean>;
+  requestBluetoothPermissions(): Promise<boolean>;
   startForegroundService(): Promise<string>;
   stopForegroundService(): Promise<string>;
   getServiceStatus(): Promise<ServiceStatus>;

@@ -76,11 +76,20 @@ class PrinterForegroundService : Service(), AgentEngine.AgentListener {
                 isForegroundRunning = true
                 val notification = buildStatusNotification()
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                    startForeground(
-                        NOTIFICATION_ID,
-                        notification,
+                    val fgsType = if (BlePrinterManager.hasBluetoothPermissions(applicationContext)) {
                         ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-                    )
+                    } else {
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                    }
+                    try {
+                        startForeground(NOTIFICATION_ID, notification, fgsType)
+                    } catch (_: Exception) {
+                        startForeground(
+                            NOTIFICATION_ID,
+                            notification,
+                            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                        )
+                    }
                 } else {
                     startForeground(NOTIFICATION_ID, notification)
                 }
