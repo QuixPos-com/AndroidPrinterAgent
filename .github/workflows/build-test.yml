@@ -19,7 +19,7 @@ concurrency:
 jobs:
   test-js:
     name: Lint, Types & JS Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
 
     steps:
       - name: Checkout repository
@@ -55,7 +55,7 @@ jobs:
 
   build-test-android:
     name: Android Build & Test Check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
 
     steps:
       - name: Checkout repository
