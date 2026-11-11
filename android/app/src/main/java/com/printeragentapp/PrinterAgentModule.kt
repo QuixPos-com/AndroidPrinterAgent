@@ -271,6 +271,17 @@ class PrinterAgentModule(private val reactContext: ReactApplicationContext) :
         }.start()
     }
 
+    @ReactMethod
+    fun closeApp(promise: Promise) {
+        try {
+            val activity = reactContext.currentActivity
+            activity?.finish()
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("CLOSE_APP_ERR", e.message, e)
+        }
+    }
+
     private fun jsonToWritableMap(jsonObject: JSONObject): WritableMap {
         val map = Arguments.createMap()
         val keys = jsonObject.keys()

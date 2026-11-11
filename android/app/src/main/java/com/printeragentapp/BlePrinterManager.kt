@@ -65,12 +65,15 @@ object BlePrinterManager {
     @Volatile
     private var appContext: Context? = null
 
-    private val mu = ReentrantLock()
+    private val mu = ReentrantLock(true)
     private var currentTarget: String = ""
     private var resolvedAddress: String = ""
     private var resolvedName: String = ""
     private var deviceModel: String = ""
     private var deviceSerial: String = ""
+    private var cachedLabelLength: Int? = null
+    private var hhLabelLengthQueried: Boolean = false
+    private var lastFullBlePollMs: Long = 0L
     private var gatt: BluetoothGatt? = null
     private var writeChar: BluetoothGattCharacteristic? = null
     private var fromPrinterChar: BluetoothGattCharacteristic? = null
@@ -113,9 +116,17 @@ object BlePrinterManager {
     private var incomingLatch: CountDownLatch? = null
     @Volatile
     private var lastIncomingPacketTime: Long = 0L
+    @Volatile
+    private var expectSgdForCurrentQuery: Boolean = false
 
     fun init(context: Context) {
         appContext = context.applicationContext
+    }
+
+    fun abortActiveQuery() {
+        synchronized(incomingLock) {
+            incomingLatch?.countDown()
+        }
     }
 
     private fun log(msg: String) {
@@ -419,7 +430,15 @@ object BlePrinterManager {
     }
 
     private fun connectAndDiscoverLocked(ctx: Context, device: BluetoothDevice, target: String): Exception? {
+        val prevAddr = resolvedAddress
         resolvedAddress = device.address ?: ""
+        if (!prevAddr.equals(resolvedAddress, ignoreCase = true)) {
+            deviceModel = ""
+            deviceSerial = ""
+            cachedLabelLength = null
+            hhLabelLengthQueried = false
+            lastFullBlePollMs = 0L
+        }
         val initialName = try { device.name ?: "" } catch (_: Exception) { "" }
         if (initialName.isNotEmpty()) {
             resolvedName = initialName
@@ -435,6 +454,10 @@ object BlePrinterManager {
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     connectStatus = BluetoothGatt.GATT_SUCCESS
                     connected = true
+                    try {
+                        g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+                    } catch (_: Exception) {
+                    }
                     connectLatch?.countDown()
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     connected = false
@@ -645,16 +668,20 @@ object BlePrinterManager {
         // as documented on Page 4 of Zebra's AppNote-BlueToothLE-v4.pdf
         val disService = g.getService(DIS_SERVICE_UUID)
         if (disService != null) {
-            val modelChar = disService.getCharacteristic(DIS_MODEL_CHAR_UUID)
-            if (modelChar != null) {
-                readCharacteristicStringLocked(g, modelChar)?.takeIf { it.isNotEmpty() }?.let {
-                    deviceModel = it
+            if (deviceModel.isEmpty()) {
+                val modelChar = disService.getCharacteristic(DIS_MODEL_CHAR_UUID)
+                if (modelChar != null) {
+                    readCharacteristicStringLocked(g, modelChar)?.takeIf { it.isNotEmpty() }?.let {
+                        deviceModel = it
+                    }
                 }
             }
-            val serialChar = disService.getCharacteristic(DIS_SERIAL_CHAR_UUID)
-            if (serialChar != null) {
-                readCharacteristicStringLocked(g, serialChar)?.takeIf { it.isNotEmpty() }?.let {
-                    deviceSerial = it
+            if (deviceSerial.isEmpty()) {
+                val serialChar = disService.getCharacteristic(DIS_SERIAL_CHAR_UUID)
+                if (serialChar != null) {
+                    readCharacteristicStringLocked(g, serialChar)?.takeIf { it.isNotEmpty() }?.let {
+                        deviceSerial = it
+                    }
                 }
             }
         }
@@ -798,18 +825,31 @@ object BlePrinterManager {
 
             val hasHqes = str.contains("WARNINGS:") && str.contains("\u0003")
             val hasHs = str.contains("\n") && str.split(",").size >= 12
+            val hasHh = str.contains("LABEL LENGTH") && str.contains("\u0003")
             val hasSgd = str.count { it == '"' } >= 2
-            if ((hasHqes || hasHs) && hasSgd) {
-                incomingLatch?.countDown()
+            if (expectSgdForCurrentQuery) {
+                if ((hasHqes || hasHs) && hasSgd) {
+                    incomingLatch?.countDown()
+                }
+            } else {
+                if (hasHqes || hasHs || hasHh) {
+                    incomingLatch?.countDown()
+                }
             }
         }
     }
 
-    fun queryBleResponseLocked(cmd: String, timeoutMs: Long = 1800L): String {
+    fun queryBleResponseLocked(
+        cmd: String,
+        timeoutMs: Long = 1800L,
+        expectSgd: Boolean = false
+    ): String {
+        if (PrinterProtocol.isPrintPending() || PrinterProtocol.isPrinting()) return ""
         val g = gatt ?: throw IllegalStateException("BLE not connected")
         synchronized(incomingLock) {
             incomingBuffer.reset()
             lastIncomingPacketTime = 0L
+            expectSgdForCurrentQuery = expectSgd
             incomingLatch = CountDownLatch(1)
         }
 
@@ -821,18 +861,20 @@ object BlePrinterManager {
         }
 
         val latch = incomingLatch
-        latch?.await(timeoutMs, TimeUnit.MILLISECONDS)
+        val matched = latch?.await(timeoutMs, TimeUnit.MILLISECONDS) ?: false
 
-        val graceDeadline = System.currentTimeMillis() + 150L
-        while (System.currentTimeMillis() < graceDeadline) {
-            try {
-                Thread.sleep(30L)
-            } catch (_: InterruptedException) {
-                break
-            }
-            val elapsed = System.currentTimeMillis() - lastIncomingPacketTime
-            if (lastIncomingPacketTime > 0 && elapsed > 80L) {
-                break
+        if (!PrinterProtocol.isPrintPending() && !PrinterProtocol.isPrinting() && (expectSgd || !matched)) {
+            val graceDeadline = System.currentTimeMillis() + if (matched) 40L else 80L
+            while (System.currentTimeMillis() < graceDeadline && !PrinterProtocol.isPrintPending() && !PrinterProtocol.isPrinting()) {
+                try {
+                    Thread.sleep(20L)
+                } catch (_: InterruptedException) {
+                    break
+                }
+                val elapsed = System.currentTimeMillis() - lastIncomingPacketTime
+                if (lastIncomingPacketTime > 0 && elapsed > 45L) {
+                    break
+                }
             }
         }
 
@@ -853,12 +895,27 @@ object BlePrinterManager {
             errors = PrinterErrors(unreachable = true)
         )
 
+        if (PrinterProtocol.isPrintPending() || PrinterProtocol.isPrinting()) return offlineInfo
+
         mu.lock()
         try {
+            if (PrinterProtocol.isPrintPending() || PrinterProtocol.isPrinting()) return offlineInfo
             ensureConnectedLocked(target)
+            if (PrinterProtocol.isPrintPending() || PrinterProtocol.isPrinting()) return offlineInfo
 
-            val queryCmd = "~HQES\r\n~HS\r\n! U1 getvar \"zpl.label_length\"\r\n! U1 getvar \"head.latch\"\r\n! U1 getvar \"device.pause\"\r\n! U1 getvar \"device.unique_id\"\r\n! U1 getvar \"device.product_name\"\r\n"
-            val response = queryBleResponseLocked(queryCmd, timeoutMs = 2000L)
+            val now = System.currentTimeMillis()
+            val hasStaticInfo = deviceModel.isNotEmpty() &&
+                deviceSerial.isNotEmpty() &&
+                (cachedLabelLength != null || hhLabelLengthQueried) &&
+                (now - lastFullBlePollMs) < 60_000L
+
+            val response = if (hasStaticInfo) {
+                queryBleResponseLocked("~HQES\r\n~HS\r\n", timeoutMs = 600L, expectSgd = false)
+            } else {
+                lastFullBlePollMs = now
+                val queryCmd = "~HQES\r\n~HS\r\n! U1 getvar \"zpl.label_length\"\r\n! U1 getvar \"head.latch\"\r\n! U1 getvar \"device.pause\"\r\n! U1 getvar \"device.unique_id\"\r\n! U1 getvar \"device.product_name\"\r\n"
+                queryBleResponseLocked(queryCmd, timeoutMs = 1500L, expectSgd = true)
+            }
 
             val parsed = if (response.isNotBlank()) {
                 PrinterProtocol.parsePrinterData(target, response)
@@ -872,15 +929,28 @@ object BlePrinterManager {
                 )
             }
 
-            var finalLabelLength = parsed.labelLength
-            if (finalLabelLength == null && connected) {
-                val hhResp = queryBleResponseLocked("^XA^HH^XZ\r\n", timeoutMs = 1800L)
+            if (parsed.labelLength != null) {
+                cachedLabelLength = parsed.labelLength
+            }
+
+            var finalLabelLength = parsed.labelLength ?: cachedLabelLength
+            if (finalLabelLength == null && connected && !hhLabelLengthQueried && !PrinterProtocol.isPrintPending() && !PrinterProtocol.isPrinting()) {
+                hhLabelLengthQueried = true
+                val hhResp = queryBleResponseLocked("^XA^HH^XZ\r\n", timeoutMs = 1200L, expectSgd = false)
                 if (hhResp.isNotBlank()) {
                     val hhParsed = PrinterProtocol.parsePrinterData(target, hhResp)
                     if (hhParsed.labelLength != null) {
                         finalLabelLength = hhParsed.labelLength
+                        cachedLabelLength = hhParsed.labelLength
                     }
                 }
+            }
+
+            if (deviceModel.isEmpty() && PrinterProtocol.isValidModelName(parsed.model)) {
+                deviceModel = parsed.model
+            }
+            if (deviceSerial.isEmpty() && parsed.serial.isNotEmpty()) {
+                deviceSerial = parsed.serial
             }
 
             val finalModel = when {
@@ -913,6 +983,10 @@ object BlePrinterManager {
         mu.lock()
         try {
             ensureConnectedLocked(target)
+            try {
+                gatt?.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+            } catch (_: Exception) {
+            }
             writeChunksLocked(zpl.toByteArray(Charsets.UTF_8))
         } finally {
             mu.unlock()
@@ -920,10 +994,17 @@ object BlePrinterManager {
     }
 
     fun queryStatusLocked(target: String): HostStatus {
+        if (PrinterProtocol.isPrintPending() || PrinterProtocol.isPrinting()) {
+            return HostStatus(printingFormat = true)
+        }
         mu.lock()
         try {
             ensureConnectedLocked(target)
-            val resp = queryBleResponseLocked("~HS~HQES\r\n! U1 getvar \"head.latch\"\r\n! U1 getvar \"device.pause\"\r\n", timeoutMs = 1500L)
+            val resp = queryBleResponseLocked(
+                "~HS~HQES\r\n! U1 getvar \"head.latch\"\r\n! U1 getvar \"device.pause\"\r\n",
+                timeoutMs = 1000L,
+                expectSgd = true
+            )
             if (resp.isBlank()) {
                 return HostStatus()
             }

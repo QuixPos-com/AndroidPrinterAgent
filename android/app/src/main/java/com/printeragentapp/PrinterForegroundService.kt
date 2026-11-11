@@ -8,8 +8,10 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import org.json.JSONObject
 
@@ -46,6 +48,8 @@ class PrinterForegroundService : Service(), AgentEngine.AgentListener {
     }
 
     private lateinit var engine: AgentEngine
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -54,10 +58,60 @@ class PrinterForegroundService : Service(), AgentEngine.AgentListener {
         engine.addListener(this)
     }
 
+    private fun acquireLocks() {
+        try {
+            if (wakeLock == null) {
+                val pm = applicationContext.getSystemService(Context.POWER_SERVICE) as? PowerManager
+                wakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PrinterAgentApp::AgentWakeLock")?.apply {
+                    setReferenceCounted(false)
+                }
+            }
+            if (wakeLock?.isHeld == false) {
+                wakeLock?.acquire()
+            }
+        } catch (_: Exception) {
+        }
+
+        try {
+            if (wifiLock == null) {
+                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                val lockMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                } else {
+                    @Suppress("DEPRECATION")
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                }
+                wifiLock = wm?.createWifiLock(lockMode, "PrinterAgentApp::AgentWifiLock")?.apply {
+                    setReferenceCounted(false)
+                }
+            }
+            if (wifiLock?.isHeld == false) {
+                wifiLock?.acquire()
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun releaseLocks() {
+        try {
+            if (wakeLock?.isHeld == true) {
+                wakeLock?.release()
+            }
+        } catch (_: Exception) {
+        }
+        try {
+            if (wifiLock?.isHeld == true) {
+                wifiLock?.release()
+            }
+        } catch (_: Exception) {
+        }
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
                 isForegroundRunning = false
+                releaseLocks()
                 engine.removeListener(this)
                 engine.stop()
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -74,6 +128,7 @@ class PrinterForegroundService : Service(), AgentEngine.AgentListener {
             }
             else -> {
                 isForegroundRunning = true
+                acquireLocks()
                 val notification = buildStatusNotification()
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                     val fgsType = if (BlePrinterManager.hasBluetoothPermissions(applicationContext)) {
@@ -102,6 +157,7 @@ class PrinterForegroundService : Service(), AgentEngine.AgentListener {
 
     override fun onDestroy() {
         isForegroundRunning = false
+        releaseLocks()
         engine.removeListener(this)
         super.onDestroy()
     }

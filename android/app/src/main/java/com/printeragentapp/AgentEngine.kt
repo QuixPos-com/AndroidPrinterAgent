@@ -1,23 +1,34 @@
 package com.printeragentapp
 
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
+import okhttp3.Call
+import okhttp3.ConnectionPool
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
-import java.net.HttpURLConnection
-import java.net.URL
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantLock
 
@@ -25,7 +36,8 @@ data class PrintJob(
     val id: String,
     val backendJobId: Int = 0,
     val agentPrinterId: Int = 0,
-    val zpl: String = ""
+    val zpl: String = "",
+    val payloadFuture: CompletableFuture<String>? = null
 )
 
 data class SseEvent(
@@ -43,6 +55,9 @@ class AgentEngine private constructor(private val appContext: Context) {
     }
 
     companion object {
+        private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+        private val EMPTY_BODY = ByteArray(0).toRequestBody(null)
+
         @Volatile
         private var instance: AgentEngine? = null
 
@@ -57,10 +72,33 @@ class AgentEngine private constructor(private val appContext: Context) {
     private val stateMu = ReentrantLock()
     private val reloadMu = ReentrantLock()
 
+    private val sharedConnectionPool = ConnectionPool(8, 5, TimeUnit.MINUTES)
+    private val httpClient: OkHttpClient = OkHttpClient.Builder()
+        .connectionPool(sharedConnectionPool)
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
+        .writeTimeout(10, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
+        .build()
+
+    private val sseHttpClient: OkHttpClient = httpClient.newBuilder()
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(35, TimeUnit.SECONDS)
+        .build()
+
+    private val prefetchExecutor = Executors.newCachedThreadPool { r ->
+        Thread(r, "ZebraJobPrefetch").apply { isDaemon = true }
+    }
+    private val jobStatusExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "ZebraJobStatus").apply { isDaemon = true }
+    }
+
     private var cfg: AgentConfigData = AgentConfigStore.load(appContext)
     private val running = AtomicBoolean(false)
     private val streamSignal = Object()
     private val printerPollSignal = Object()
+    private val lastPrintActivityMs = AtomicLong(0L)
+    private val isPrinting = AtomicBoolean(false)
 
     private val jobsQueue = LinkedBlockingQueue<PrintJob>(256)
     private var seq = 0
@@ -86,8 +124,9 @@ class AgentEngine private constructor(private val appContext: Context) {
     private val listeners = CopyOnWriteArrayList<AgentListener>()
 
     private var monitorServer: LocalMonitorServer? = null
-    private val currentStreamConn = AtomicReference<HttpURLConnection?>(null)
+    private val currentStreamCall = AtomicReference<Call?>(null)
     private val workerReset = AtomicBoolean(false)
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     init {
         BlePrinterManager.init(appContext)
@@ -118,6 +157,8 @@ class AgentEngine private constructor(private val appContext: Context) {
 
     fun logf(msg: String) {
         val line = "${nowTimeStr()} $msg"
+        println(line)
+        android.util.Log.i("ZebraAgent", msg)
         synchronized(logs) {
             if (logs.size >= 1000) {
                 logs.removeFirst()
@@ -166,6 +207,38 @@ class AgentEngine private constructor(private val appContext: Context) {
         }
     }
 
+    private fun registerNetworkCallback() {
+        try {
+            val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+            if (networkCallback != null) return
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    if (running.get() && isPaired() && !isBackendConnected()) {
+                        synchronized(streamSignal) {
+                            streamSignal.notifyAll()
+                        }
+                    }
+                }
+            }
+            val req = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            cm.registerNetworkCallback(req, cb)
+            networkCallback = cb
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        try {
+            val cb = networkCallback ?: return
+            networkCallback = null
+            val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            cm?.unregisterNetworkCallback(cb)
+        } catch (_: Exception) {
+        }
+    }
+
     fun start() {
         if (!running.compareAndSet(false, true)) {
             return
@@ -178,6 +251,8 @@ class AgentEngine private constructor(private val appContext: Context) {
         mu.unlock()
 
         logf("ZebraAgent starting on Android (ApiUrl=\"${cfg.apiUrl}\", ZplPrinters=${cfg.zplPrinters}, Port=\"${cfg.port}\")")
+
+        registerNetworkCallback()
 
         // 1. Start Local Monitor Server
         val portNum = cfg.port.toIntOrNull() ?: 41783
@@ -192,12 +267,14 @@ class AgentEngine private constructor(private val appContext: Context) {
         // 3. Start Job Worker Thread
         Thread({ workerLoop() }, "ZebraJobWorker").apply {
             isDaemon = true
+            priority = Thread.MAX_PRIORITY
             start()
         }
 
         // 4. Start Upstream SSE Loop Thread
         Thread({ sseMainLoop() }, "ZebraSseLoop").apply {
             isDaemon = true
+            priority = Thread.MAX_PRIORITY
             start()
         }
 
@@ -209,7 +286,8 @@ class AgentEngine private constructor(private val appContext: Context) {
             return
         }
         logf("ZebraAgent shutting down...")
-        currentStreamConn.getAndSet(null)?.disconnect()
+        unregisterNetworkCallback()
+        currentStreamCall.getAndSet(null)?.cancel()
         BlePrinterManager.disconnect()
         synchronized(streamSignal) { streamSignal.notifyAll() }
         synchronized(printerPollSignal) { printerPollSignal.notifyAll() }
@@ -261,6 +339,15 @@ class AgentEngine private constructor(private val appContext: Context) {
         } finally {
             mu.unlock()
         }
+    }
+
+    fun isPrinting(): Boolean {
+        if (isPrinting.get()) return true
+        if (jobsQueue.isNotEmpty()) return true
+        if (activeJobs.isNotEmpty()) return true
+        if (PrinterProtocol.isPrinting() || PrinterProtocol.isPrintPending()) return true
+        if (System.currentTimeMillis() - lastPrintActivityMs.get() < 5000L) return true
+        return false
     }
 
     fun setApiUrl(rawUrl: String) {
@@ -366,6 +453,7 @@ class AgentEngine private constructor(private val appContext: Context) {
     }
 
     fun reconnectPrinters() {
+        PrinterProtocol.clearCache()
         BlePrinterManager.disconnect()
         mu.lock()
         lastPrinterInfo = PrinterInfo(
@@ -386,7 +474,7 @@ class AgentEngine private constructor(private val appContext: Context) {
 
     private fun wakeStream() {
         workerReset.set(true)
-        currentStreamConn.getAndSet(null)?.disconnect()
+        currentStreamCall.getAndSet(null)?.cancel()
         synchronized(streamSignal) {
             streamSignal.notifyAll()
         }
@@ -417,23 +505,14 @@ class AgentEngine private constructor(private val appContext: Context) {
 
         logf("Pairing with provided pairingpin: $cleanPin at $reqUrl...")
 
-        val conn = (URL(reqUrl).openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            connectTimeout = 15000
-            readTimeout = 15000
-            doOutput = true
-            setRequestProperty("Content-Type", "application/json")
-        }
+        val request = Request.Builder()
+            .url(reqUrl)
+            .post(reqBody.toString().toRequestBody(JSON_MEDIA_TYPE))
+            .build()
 
-        return try {
-            conn.outputStream.use { os ->
-                os.write(reqBody.toString().toByteArray(Charsets.UTF_8))
-                os.flush()
-            }
-
-            val code = conn.responseCode
-            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            val respText = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
+        httpClient.newCall(request).execute().use { resp ->
+            val code = resp.code
+            val respText = resp.body?.string() ?: ""
 
             if (code != 200) {
                 throw IllegalStateException("pairing failed (HTTP $code): ${respText.trim()}")
@@ -470,9 +549,7 @@ class AgentEngine private constructor(private val appContext: Context) {
             }
             broadcastEvent("paired", JSONObject().put("agentId", id).put("name", name))
             logf("Successfully paired: Agent \"$name\" (ID: $id)")
-            resultObj
-        } finally {
-            conn.disconnect()
+            return resultObj
         }
     }
 
@@ -717,79 +794,81 @@ class AgentEngine private constructor(private val appContext: Context) {
         val sep = if (base.contains("?")) "&" else "?"
         val fullUrl = "${base}${sep}token=${URLEncoder.encode(cfgSnap.token, "UTF-8")}&agentversion=${AgentConfigStore.AGENT_VERSION}"
 
-        val conn = (URL(fullUrl).openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            connectTimeout = 10_000
-            // 35s heartbeat timeout matching HeartbeatTimeout in service/sse.go
-            readTimeout = 35_000
-            setRequestProperty("Authorization", "Bearer ${cfgSnap.token}")
-            setRequestProperty("agentversion", AgentConfigStore.AGENT_VERSION)
-            setRequestProperty("Accept", "text/event-stream")
-            setRequestProperty("Cache-Control", "no-cache")
-            val lid = lastIdRef()
-            if (lid.isNotEmpty()) {
-                setRequestProperty("Last-Event-ID", lid)
-            }
+        val reqBuilder = Request.Builder()
+            .url(fullUrl)
+            .get()
+            .header("Authorization", "Bearer ${cfgSnap.token}")
+            .header("agentversion", AgentConfigStore.AGENT_VERSION)
+            .header("Accept", "text/event-stream")
+            .header("Cache-Control", "no-cache")
+
+        val lid = lastIdRef()
+        if (lid.isNotEmpty()) {
+            reqBuilder.header("Last-Event-ID", lid)
         }
 
-        currentStreamConn.set(conn)
+        val call = sseHttpClient.newCall(reqBuilder.build())
+        currentStreamCall.set(call)
         try {
-            val code = conn.responseCode
-            if (code == 401) {
-                val errBody = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
-                throw UnauthorizedException("HTTP 401: ${errBody.trim()}")
-            }
-            if (code != 200) {
-                val errBody = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
-                throw Exception("HTTP $code: ${errBody.trim()}")
-            }
+            call.execute().use { resp ->
+                val code = resp.code
+                if (code == 401) {
+                    val errBody = resp.body?.string() ?: ""
+                    throw UnauthorizedException("HTTP 401: ${errBody.trim()}")
+                }
+                if (code != 200) {
+                    val errBody = resp.body?.string() ?: ""
+                    throw Exception("HTTP $code: ${errBody.trim()}")
+                }
 
-            logf("SSE connected to $base")
-            onConnected(true)
+                val body = resp.body ?: throw Exception("empty SSE response body")
+                logf("SSE connected to $base")
+                onConnected(true)
 
-            val reader = BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8), 64 * 1024)
-            var evId = ""
-            var evType = ""
-            val dataLines = ArrayList<String>()
+                val reader = BufferedReader(InputStreamReader(body.byteStream(), Charsets.UTF_8), 1024)
+                var evId = ""
+                var evType = ""
+                val dataLines = ArrayList<String>()
 
-            while (running.get() && !workerReset.get()) {
-                val rawLine = reader.readLine() ?: break
-                val line = rawLine.trimEnd('\r', '\n')
+                while (running.get() && !workerReset.get()) {
+                    val rawLine = reader.readLine() ?: break
+                    val line = rawLine.trimEnd('\r', '\n')
 
-                when {
-                    line.isEmpty() -> {
-                        if (dataLines.isNotEmpty() || evType.isNotEmpty()) {
-                            val dataStr = dataLines.joinToString("\n")
-                            if (evId.isNotEmpty()) {
-                                setLastId(evId)
+                    when {
+                        line.isEmpty() -> {
+                            if (dataLines.isNotEmpty() || evType.isNotEmpty()) {
+                                val dataStr = dataLines.joinToString("\n")
+                                if (evId.isNotEmpty()) {
+                                    setLastId(evId)
+                                }
+                                handleSseEvent(SseEvent(id = evId, event = evType, data = dataStr))
                             }
-                            handleSseEvent(SseEvent(id = evId, event = evType, data = dataStr))
+                            evId = ""
+                            evType = ""
+                            dataLines.clear()
                         }
-                        evId = ""
-                        evType = ""
-                        dataLines.clear()
-                    }
-                    line.startsWith(":") -> {
-                        // Heartbeat comment frame ": heartbeat"
-                    }
-                    else -> {
-                        val colonIdx = line.indexOf(':')
-                        val field = if (colonIdx != -1) line.substring(0, colonIdx) else line
-                        var value = if (colonIdx != -1) line.substring(colonIdx + 1) else ""
-                        if (value.startsWith(" ")) {
-                            value = value.substring(1)
+                        line.startsWith(":") -> {
+                            // Heartbeat comment frame ": heartbeat"
                         }
-                        when (field) {
-                            "data" -> dataLines.add(value)
-                            "id" -> evId = value
-                            "event" -> evType = value
+                        else -> {
+                            val colonIdx = line.indexOf(':')
+                            val field = if (colonIdx != -1) line.substring(0, colonIdx) else line
+                            var value = if (colonIdx != -1) line.substring(colonIdx + 1) else ""
+                            if (value.startsWith(" ")) {
+                                value = value.substring(1)
+                            }
+                            when (field) {
+                                "data" -> dataLines.add(value)
+                                "id" -> evId = value
+                                "event" -> evType = value
+                            }
                         }
                     }
                 }
             }
         } finally {
-            currentStreamConn.compareAndSet(conn, null)
-            conn.disconnect()
+            currentStreamCall.compareAndSet(call, null)
+            call.cancel()
         }
     }
 
@@ -848,8 +927,9 @@ class AgentEngine private constructor(private val appContext: Context) {
                 return
             }
             if (action.equals("created", ignoreCase = true)) {
+                val inlineData = jobEv.optString("data", "").ifEmpty { jobEv.optString("zpl", "") }
                 logf("Backend SSE event: job created (jobId=$jobId agentprinterId=$agentPrinterId type=\"$jobType\")")
-                handleJobCreated(jobId, agentPrinterId, "")
+                handleJobCreated(jobId, agentPrinterId, inlineData)
                 return
             }
         }
@@ -971,8 +1051,10 @@ class AgentEngine private constructor(private val appContext: Context) {
 
         logf("Executing cancel (model=\"$reqModel\" serial=\"$reqSerial\" type=\"zpl\"): sending ~JP to printer $ip")
         try {
+            val startTime = System.currentTimeMillis()
             PrinterProtocol.sendZPL(ip, "~JP")
-            logf("Successfully sent ~JP to printer $ip")
+            val elapsed = System.currentTimeMillis() - startTime
+            logf("Successfully sent ~JP to printer $ip in ${elapsed}ms")
             broadcastEvent(
                 "cancel",
                 JSONObject().apply {
@@ -998,10 +1080,19 @@ class AgentEngine private constructor(private val appContext: Context) {
                 null
             } ?: continue
 
-            if (job.backendJobId > 0) {
-                runBackendJob(job)
-            } else {
-                runDirectJob(job)
+            isPrinting.set(true)
+            PrinterProtocol.setPrinting(true)
+            lastPrintActivityMs.set(System.currentTimeMillis())
+            try {
+                if (job.backendJobId > 0) {
+                    runBackendJob(job)
+                } else {
+                    runDirectJob(job)
+                }
+            } finally {
+                lastPrintActivityMs.set(System.currentTimeMillis())
+                isPrinting.set(false)
+                PrinterProtocol.setPrinting(false)
             }
         }
     }
@@ -1012,71 +1103,27 @@ class AgentEngine private constructor(private val appContext: Context) {
             reportState(j.id, "error", "no printer IP configured")
             return
         }
+        logf("Writing print job ${j.id} (${j.zpl.length} bytes) to printer $ip...")
+        val startTime = System.currentTimeMillis()
         try {
             PrinterProtocol.sendZPL(ip, j.zpl)
         } catch (e: Exception) {
+            val elapsed = System.currentTimeMillis() - startTime
+            logf("Failed to send job ${j.id} to printer $ip after ${elapsed}ms: ${e.message}")
             reportState(j.id, "error", "send failed: ${e.message}")
             return
         }
+        val elapsed = System.currentTimeMillis() - startTime
+        logf("Time spent sending job ${j.id} to printer $ip: ${elapsed}ms")
         reportState(j.id, "sent", "")
 
-        var last = ""
-        var failures = 0
-        val deadline = System.currentTimeMillis() + 5 * 60 * 1000L
-        var sawBusy = false
-        var idleSince = 0L
-
-        while (running.get() && System.currentTimeMillis() < deadline) {
-            try {
-                Thread.sleep(1000)
-            } catch (_: InterruptedException) {
-                return
-            }
-
-            val st = try {
-                PrinterProtocol.queryStatus(ip)
-            } catch (e: Exception) {
-                failures++
-                if (failures >= 5) {
-                    reportState(j.id, "error", "status poll failed: ${e.message}")
-                    return
-                }
-                continue
-            }
-            failures = 0
-
-            mu.lock()
-            paperStatus = if (st.paperOut) "out" else "ok"
-            lastFault = st.fault()
-            printerReady = true
-            mu.unlock()
-
-            val f = st.fault()
-            if (f.isNotEmpty()) {
-                if (last != "fault:$f") {
-                    reportState(j.id, "fault", f)
-                    last = "fault:$f"
-                }
-                continue
-            }
-            if (st.busy()) {
-                sawBusy = true
-                idleSince = 0L
-                if (last != "printing") {
-                    reportState(j.id, "printing", "formats=${st.formatsInBuffer} labelsRemaining=${st.labelsRemaining}")
-                    last = "printing"
-                }
-                continue
-            }
-            if (idleSince == 0L) {
-                idleSince = System.currentTimeMillis()
-            }
-            if (sawBusy || (System.currentTimeMillis() - idleSince) >= 2000L) {
-                reportState(j.id, "done", "")
-                return
-            }
+        // Non-intrusive pause for physical print without polling status while printing
+        try {
+            Thread.sleep(2000L)
+        } catch (_: InterruptedException) {
+            return
         }
-        reportState(j.id, "error", "timeout waiting for printer")
+        reportState(j.id, "done", "")
     }
 
     private fun runBackendJob(j: PrintJob) {
@@ -1087,13 +1134,25 @@ class AgentEngine private constructor(private val appContext: Context) {
             return
         }
 
+        // Signal background status poller immediately so printer lock is free by the time ZPL is ready
+        BlePrinterManager.abortActiveQuery()
+
         var zpl = j.zpl
         if (zpl.isEmpty()) {
             zpl = try {
-                fetchJobPayload(jobId)
-            } catch (e: Exception) {
+                val prefetched = j.payloadFuture
+                if (prefetched != null) {
+                    try {
+                        prefetched.get(10, TimeUnit.SECONDS)
+                    } catch (e: Exception) {
+                        throw (e.cause ?: e)
+                    }
+                } else {
+                    fetchJobPayload(jobId)
+                }
+            } catch (e: Throwable) {
                 logf("Failed to fetch payload for job $jobId: ${e.message}")
-                patchJobFailed(jobId)
+                jobStatusExecutor.execute { patchJobFailed(jobId) }
                 reportState(j.id, "error", "fetch failed: ${e.message}")
                 finishJob(jobId)
                 return
@@ -1106,38 +1165,39 @@ class AgentEngine private constructor(private val appContext: Context) {
             return
         }
 
-        markJobProcessing(jobId)
-        reportState(j.id, "processing", "")
-
         val ip = getPrinters().firstOrNull() ?: ""
         if (ip.isEmpty()) {
             logf("Failed to execute job $jobId: no printer IP configured")
-            patchJobFailed(jobId)
+            jobStatusExecutor.execute { patchJobFailed(jobId) }
             reportState(j.id, "error", "no printer IP configured")
             finishJob(jobId)
             return
         }
 
+        // Dispatch "processing" status asynchronously on sequential jobStatusExecutor
+        // so sending ZPL to the printer starts immediately without waiting for an HTTP round-trip
+        jobStatusExecutor.execute { markJobProcessing(jobId) }
+        reportState(j.id, "processing", "")
+
         logf("Writing print job $jobId (${zpl.length} bytes) to printer $ip...")
+        val startTime = System.currentTimeMillis()
         try {
             PrinterProtocol.sendZPL(ip, zpl)
         } catch (e: Exception) {
-            logf("Failed to execute job $jobId: ${e.message}")
-            patchJobFailed(jobId)
+            val elapsed = System.currentTimeMillis() - startTime
+            logf("Failed to send job $jobId to printer $ip after ${elapsed}ms: ${e.message}")
+            jobStatusExecutor.execute { patchJobFailed(jobId) }
             reportState(j.id, "error", "send failed: ${e.message}")
             finishJob(jobId)
             return
         }
+        val elapsed = System.currentTimeMillis() - startTime
+        logf("Time spent sending job $jobId to printer $ip: ${elapsed}ms")
 
-        markJobCompleted(jobId)
+        jobStatusExecutor.execute { markJobCompleted(jobId) }
         reportState(j.id, "completed", "")
         logf("Job $jobId successfully completed.")
         finishJob(jobId)
-
-        try {
-            Thread.sleep(300)
-        } catch (_: InterruptedException) {
-        }
     }
 
     private fun handleJobCreated(jobId: Int, agentPrinterId: Int, data: String) {
@@ -1148,16 +1208,27 @@ class AgentEngine private constructor(private val appContext: Context) {
             return
         }
         activeJobs[jobId] = true
+        lastPrintActivityMs.set(System.currentTimeMillis())
+        BlePrinterManager.abortActiveQuery()
+
+        // Start fetching the job payload immediately in parallel while the job enters the queue
+        val future = if (data.isEmpty()) {
+            CompletableFuture.supplyAsync({ fetchJobPayload(jobId) }, prefetchExecutor)
+        } else {
+            null
+        }
 
         val job = PrintJob(
             id = jobId.toString(),
             backendJobId = jobId,
             agentPrinterId = agentPrinterId,
-            zpl = data
+            zpl = data,
+            payloadFuture = future
         )
         if (!jobsQueue.offer(job)) {
             logf("Agent job queue full, cannot enqueue job $jobId")
-            patchJobFailed(jobId)
+            future?.cancel(true)
+            jobStatusExecutor.execute { patchJobFailed(jobId) }
             finishJob(jobId)
         }
     }
@@ -1188,24 +1259,21 @@ class AgentEngine private constructor(private val appContext: Context) {
         val cfgSnap = getConfigSnapshot()
         if (cfgSnap.token.isEmpty()) throw Exception("no auth token")
         val reqUrl = cfgSnap.endpoint("jobs/$jobId")
-        val conn = (URL(reqUrl).openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            connectTimeout = 15000
-            readTimeout = 15000
-            setRequestProperty("Authorization", "Bearer ${cfgSnap.token}")
-            setRequestProperty("agentversion", AgentConfigStore.AGENT_VERSION)
-        }
-        return try {
-            val code = conn.responseCode
+        val request = Request.Builder()
+            .url(reqUrl)
+            .get()
+            .header("Authorization", "Bearer ${cfgSnap.token}")
+            .header("agentversion", AgentConfigStore.AGENT_VERSION)
+            .build()
+
+        httpClient.newCall(request).execute().use { resp ->
+            val code = resp.code
+            val text = resp.body?.string() ?: ""
             if (code != 200) {
-                val err = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
-                throw Exception("HTTP $code: ${err.trim()}")
+                throw Exception("HTTP $code: ${text.trim()}")
             }
-            val text = conn.inputStream.bufferedReader().use { it.readText() }
             val json = JSONObject(text)
-            json.optJSONObject("job")?.optString("data", "") ?: ""
-        } finally {
-            conn.disconnect()
+            return json.optJSONObject("job")?.optString("data", "") ?: ""
         }
     }
 
@@ -1225,33 +1293,28 @@ class AgentEngine private constructor(private val appContext: Context) {
         val cfgSnap = getConfigSnapshot()
         if (cfgSnap.token.isEmpty()) return
         val reqUrl = cfgSnap.endpoint(subpath)
-        val conn = (URL(reqUrl).openConnection() as HttpURLConnection).apply {
-            requestMethod = if (method == "PATCH") "POST" else method
-            if (method == "PATCH") {
-                setRequestProperty("X-HTTP-Method-Override", "PATCH")
-            }
-            connectTimeout = 15000
-            readTimeout = 15000
-            setRequestProperty("Authorization", "Bearer ${cfgSnap.token}")
-            setRequestProperty("agentversion", AgentConfigStore.AGENT_VERSION)
-            if (body != null) {
-                doOutput = true
-                setRequestProperty("Content-Type", "application/json")
-            }
+        val reqBody = body?.toRequestBody(JSON_MEDIA_TYPE) ?: EMPTY_BODY
+        val reqBuilder = Request.Builder()
+            .url(reqUrl)
+            .header("Authorization", "Bearer ${cfgSnap.token}")
+            .header("agentversion", AgentConfigStore.AGENT_VERSION)
+
+        if (method == "PATCH") {
+            reqBuilder.patch(reqBody)
+        } else {
+            reqBuilder.method(method, reqBody)
         }
+
         try {
-            if (body != null) {
-                conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-            }
-            val code = conn.responseCode
-            if (code >= 300) {
-                val err = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
-                logf("$subpath HTTP $code: ${err.trim()}")
+            httpClient.newCall(reqBuilder.build()).execute().use { resp ->
+                val code = resp.code
+                if (code >= 300) {
+                    val err = resp.body?.string() ?: ""
+                    logf("$subpath HTTP $code: ${err.trim()}")
+                }
             }
         } catch (e: Exception) {
             logf("$subpath error: ${e.message}")
-        } finally {
-            conn.disconnect()
         }
     }
 
@@ -1259,38 +1322,37 @@ class AgentEngine private constructor(private val appContext: Context) {
         val cfgSnap = getConfigSnapshot()
         if (cfgSnap.token.isEmpty()) return
         val reqUrl = cfgSnap.endpoint("jobs?state=pending")
-        val conn = (URL(reqUrl).openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            connectTimeout = 15000
-            readTimeout = 15000
-            setRequestProperty("Authorization", "Bearer ${cfgSnap.token}")
-            setRequestProperty("agentversion", AgentConfigStore.AGENT_VERSION)
-        }
+        val request = Request.Builder()
+            .url(reqUrl)
+            .get()
+            .header("Authorization", "Bearer ${cfgSnap.token}")
+            .header("agentversion", AgentConfigStore.AGENT_VERSION)
+            .build()
+
         try {
-            val code = conn.responseCode
-            if (code != 200) {
-                val err = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
-                logf("drainBacklog HTTP $code: ${err.trim()}")
-                return
-            }
-            val body = conn.inputStream.bufferedReader().use { it.readText() }
-            val json = JSONObject(body)
-            val jobsArr = json.optJSONArray("jobs") ?: return
-            if (jobsArr.length() > 0) {
-                logf("Processing ${jobsArr.length()} pending jobs from backlog...")
-                for (i in 0 until jobsArr.length()) {
-                    val j = jobsArr.optJSONObject(i) ?: continue
-                    handleJobCreated(
-                        jobId = j.optInt("id", 0),
-                        agentPrinterId = j.optInt("agentprinterId", 0),
-                        data = j.optString("data", "")
-                    )
+            httpClient.newCall(request).execute().use { resp ->
+                val code = resp.code
+                val body = resp.body?.string() ?: ""
+                if (code != 200) {
+                    logf("drainBacklog HTTP $code: ${body.trim()}")
+                    return
+                }
+                val json = JSONObject(body)
+                val jobsArr = json.optJSONArray("jobs") ?: return
+                if (jobsArr.length() > 0) {
+                    logf("Processing ${jobsArr.length()} pending jobs from backlog...")
+                    for (i in 0 until jobsArr.length()) {
+                        val j = jobsArr.optJSONObject(i) ?: continue
+                        handleJobCreated(
+                            jobId = j.optInt("id", 0),
+                            agentPrinterId = j.optInt("agentprinterId", 0),
+                            data = j.optString("data", "")
+                        )
+                    }
                 }
             }
         } catch (e: Exception) {
             logf("drainBacklog error: ${e.message}")
-        } finally {
-            conn.disconnect()
         }
     }
 
@@ -1300,24 +1362,37 @@ class AgentEngine private constructor(private val appContext: Context) {
     private fun printerPollerLoop() {
         var lastInfo = PrinterInfo(ip = "")
         var hasPolledOnce = false
+        var wasPrinting = false
 
         while (running.get()) {
             try {
-                checkAndReportPrinter(
-                    lastInfo = lastInfo,
-                    hasPolledOnce = hasPolledOnce,
-                    updateTrackers = { newLast, polled ->
-                        lastInfo = newLast
-                        hasPolledOnce = polled
+                if (isPrinting()) {
+                    if (!wasPrinting) {
+                        wasPrinting = true
+                        logf("Printer is printing; status polling paused.")
                     }
-                )
+                } else {
+                    if (wasPrinting) {
+                        wasPrinting = false
+                        logf("Printing finished; resuming status polling.")
+                    }
+                    checkAndReportPrinter(
+                        lastInfo = lastInfo,
+                        hasPolledOnce = hasPolledOnce,
+                        updateTrackers = { newLast, polled ->
+                            lastInfo = newLast
+                            hasPolledOnce = polled
+                        }
+                    )
+                }
             } catch (e: Exception) {
                 logf("Printer poller error: ${e.message}")
             }
 
             synchronized(printerPollSignal) {
                 try {
-                    printerPollSignal.wait(5000L)
+                    val waitMs = if (isPrinting()) 2000L else 5000L
+                    printerPollSignal.wait(waitMs)
                 } catch (_: InterruptedException) {
                 }
             }
@@ -1329,6 +1404,10 @@ class AgentEngine private constructor(private val appContext: Context) {
         hasPolledOnce: Boolean,
         updateTrackers: (PrinterInfo, Boolean) -> Unit
     ) {
+        if (isPrinting()) return
+        if (jobsQueue.isNotEmpty() || activeJobs.isNotEmpty() || PrinterProtocol.isPrintPending() || PrinterProtocol.isPrinting()) return
+        if (System.currentTimeMillis() - lastPrintActivityMs.get() < 5000L) return
+
         val printers = getPrinters()
         if (printers.isEmpty()) return
 
@@ -1343,6 +1422,8 @@ class AgentEngine private constructor(private val appContext: Context) {
         mu.unlock()
 
         for (secIp in printers.drop(1)) {
+            if (isPrinting()) break
+            if (jobsQueue.isNotEmpty() || activeJobs.isNotEmpty() || PrinterProtocol.isPrintPending() || PrinterProtocol.isPrinting()) break
             val (secInfo, secOk) = PrinterProtocol.tryQueryPrinterInfo(secIp)
             if (secOk) {
                 val prevSec = printersInfo.put(secIp, secInfo)
@@ -1505,33 +1586,26 @@ class AgentEngine private constructor(private val appContext: Context) {
             mu.unlock()
 
             val reqUrl = cfgSnap.endpoint("/state") + "?agentversion=${AgentConfigStore.AGENT_VERSION}"
-            val conn = (URL(reqUrl).openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                connectTimeout = 15000
-                readTimeout = 15000
-                doOutput = true
-                setRequestProperty("Authorization", "Bearer ${cfgSnap.token}")
-                setRequestProperty("Content-Type", "application/json")
-                setRequestProperty("agentversion", AgentConfigStore.AGENT_VERSION)
-            }
+            val request = Request.Builder()
+                .url(reqUrl)
+                .post(bodyStr.toRequestBody(JSON_MEDIA_TYPE))
+                .header("Authorization", "Bearer ${cfgSnap.token}")
+                .header("agentversion", AgentConfigStore.AGENT_VERSION)
+                .build()
 
             try {
-                conn.outputStream.use { os ->
-                    os.write(bodyStr.toByteArray(Charsets.UTF_8))
-                    os.flush()
-                }
-                val code = conn.responseCode
-                if (code >= 300) {
-                    val errText = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
-                    logf("postState HTTP $code: ${errText.trim()}")
-                } else {
-                    val labelLenStr = info.labelLength?.toString() ?: "null"
-                    logf("Posted printer state upstream: HTTP $code (model=\"${info.model}\" serial=\"${info.serial}\" type=\"zpl\" labelLength=$labelLenStr)")
+                httpClient.newCall(request).execute().use { resp ->
+                    val code = resp.code
+                    if (code >= 300) {
+                        val errText = resp.body?.string() ?: ""
+                        logf("postState HTTP $code: ${errText.trim()}")
+                    } else {
+                        val labelLenStr = info.labelLength?.toString() ?: "null"
+                        logf("Posted printer state upstream: HTTP $code (model=\"${info.model}\" serial=\"${info.serial}\" type=\"zpl\" labelLength=$labelLenStr)")
+                    }
                 }
             } catch (e: Exception) {
                 logf("postState failed: ${e.message}")
-            } finally {
-                conn.disconnect()
             }
         } finally {
             stateMu.unlock()

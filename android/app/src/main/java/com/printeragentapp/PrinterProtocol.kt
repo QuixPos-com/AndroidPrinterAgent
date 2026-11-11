@@ -8,9 +8,14 @@ import java.net.NetworkInterface
 import java.net.Socket
 import java.util.Collections
 import java.util.concurrent.Callable
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantLock
 
 data class HostStatus(
@@ -35,7 +40,33 @@ data class HostStatus(
 
 object PrinterProtocol {
     const val PRINTER_PORT = 9100
-    private val printerLock = ReentrantLock()
+    private val printerLock = ReentrantLock(true)
+    private val urgentPrintCount = AtomicInteger(0)
+    private val isPrinting = AtomicBoolean(false)
+
+    private data class CachedPrinterMeta(
+        val model: String,
+        val serial: String,
+        val labelLength: Int?,
+        val updatedAtMs: Long
+    )
+
+    private val cachedMeta = ConcurrentHashMap<String, CachedPrinterMeta>()
+
+    fun isPrinting(): Boolean = isPrinting.get()
+
+    fun setPrinting(printing: Boolean) {
+        isPrinting.set(printing)
+        if (printing) {
+            BlePrinterManager.abortActiveQuery()
+        }
+    }
+
+    fun isPrintPending(): Boolean = urgentPrintCount.get() > 0 || isPrinting.get()
+
+    fun clearCache() {
+        cachedMeta.clear()
+    }
 
     fun isValidPrinterTarget(target: String): Boolean {
         val clean = target.trim()
@@ -53,17 +84,33 @@ object PrinterProtocol {
     }
 
     fun tryQueryPrinterInfo(ip: String): Pair<PrinterInfo, Boolean> {
-        if (!printerLock.tryLock()) {
+        if (isPrinting() || isPrintPending() || !printerLock.tryLock()) {
             return Pair(PrinterInfo(ip = ip), false)
         }
         return try {
-            Pair(queryPrinterInfoLocked(ip), true)
+            if (isPrinting() || isPrintPending()) {
+                Pair(PrinterInfo(ip = ip), false)
+            } else {
+                Pair(queryPrinterInfoLocked(ip), true)
+            }
         } finally {
             printerLock.unlock()
         }
     }
 
     fun queryPrinterInfo(ip: String): PrinterInfo {
+        if (isPrinting() || isPrintPending()) {
+            val cached = cachedMeta[ip]
+            return PrinterInfo(
+                ip = ip,
+                model = cached?.model ?: "",
+                serial = cached?.serial ?: "",
+                labelLength = cached?.labelLength,
+                type = "zpl",
+                status = "printing",
+                ready = true
+            )
+        }
         printerLock.lock()
         return try {
             queryPrinterInfoLocked(ip)
@@ -97,21 +144,33 @@ object PrinterProtocol {
         }
 
         val (host, port) = parseHostPort(ip)
+        val now = System.currentTimeMillis()
+        val cached = cachedMeta[ip]
+        val useFastPoll = cached != null &&
+            cached.model.isNotEmpty() &&
+            cached.serial.isNotEmpty() &&
+            (now - cached.updatedAtMs) < 60_000L
+
         return try {
             Socket().use { socket ->
-                socket.connect(InetSocketAddress(host, port), 3000)
-                socket.soTimeout = 600
+                socket.tcpNoDelay = true
+                socket.connect(InetSocketAddress(host, port), 1800)
+                socket.soTimeout = if (useFastPoll) 300 else 500
                 val out = socket.getOutputStream()
-                val cmd = "^XA^HH^XZ~HI~HQES! U1 getvar \"device.unique_id\"\r\n".toByteArray(Charsets.UTF_8)
+                val cmd = if (useFastPoll) {
+                    "~HQES\r\n".toByteArray(Charsets.UTF_8)
+                } else {
+                    "^XA^HH^XZ~HI~HQES! U1 getvar \"device.unique_id\"\r\n".toByteArray(Charsets.UTF_8)
+                }
                 out.write(cmd)
                 out.flush()
 
                 val received = StringBuilder()
                 val buf = ByteArray(4096)
                 val input = socket.getInputStream()
-                val deadline = System.currentTimeMillis() + 4000L
+                val deadline = System.currentTimeMillis() + if (useFastPoll) 900L else 2500L
 
-                while (System.currentTimeMillis() < deadline) {
+                while (System.currentTimeMillis() < deadline && !isPrintPending()) {
                     val n = try {
                         input.read(buf)
                     } catch (_: Exception) {
@@ -122,9 +181,13 @@ object PrinterProtocol {
                         val str = received.toString()
                         val hqesEnd = str.indexOf("WARNINGS:")
                         val hasCompleteHQES = hqesEnd != -1 && str.substring(hqesEnd).contains("\u0003")
-                        val hasCompleteSGD = hqesEnd != -1 && str.substring(hqesEnd).count { it == '"' } >= 2
-                        if (str.contains("LABEL LENGTH") && hasCompleteHQES && hasCompleteSGD) {
-                            break
+                        if (useFastPoll) {
+                            if (hasCompleteHQES) break
+                        } else {
+                            val hasCompleteSGD = hqesEnd != -1 && str.substring(hqesEnd).count { it == '"' } >= 2
+                            if (str.contains("LABEL LENGTH") && hasCompleteHQES && hasCompleteSGD) {
+                                break
+                            }
                         }
                     } else {
                         break
@@ -132,7 +195,27 @@ object PrinterProtocol {
                 }
 
                 val data = received.toString()
-                if (data.isEmpty()) offlineInfo else parsePrinterData(ip, data)
+                if (data.isEmpty()) {
+                    offlineInfo
+                } else {
+                    val parsed = parsePrinterData(ip, data)
+                    val mergedModel = parsed.model.ifEmpty { cached?.model ?: "" }
+                    val mergedSerial = parsed.serial.ifEmpty { cached?.serial ?: "" }
+                    val mergedLabelLen = parsed.labelLength ?: cached?.labelLength
+                    if (mergedModel.isNotEmpty() || mergedSerial.isNotEmpty()) {
+                        cachedMeta[ip] = CachedPrinterMeta(
+                            model = mergedModel,
+                            serial = mergedSerial,
+                            labelLength = mergedLabelLen,
+                            updatedAtMs = if (useFastPoll) (cached?.updatedAtMs ?: now) else now
+                        )
+                    }
+                    parsed.copy(
+                        model = mergedModel,
+                        serial = mergedSerial,
+                        labelLength = mergedLabelLen
+                    )
+                }
             }
         } catch (_: Exception) {
             offlineInfo
@@ -140,6 +223,8 @@ object PrinterProtocol {
     }
 
     fun sendZPL(ip: String, zpl: String) {
+        urgentPrintCount.incrementAndGet()
+        BlePrinterManager.abortActiveQuery()
         printerLock.lock()
         try {
             if (BlePrinterManager.isBluetoothTarget(ip)) {
@@ -148,13 +233,15 @@ object PrinterProtocol {
             }
             val (host, port) = parseHostPort(ip)
             Socket().use { socket ->
-                socket.connect(InetSocketAddress(host, port), 5000)
-                socket.soTimeout = 15000
+                socket.tcpNoDelay = true
+                socket.connect(InetSocketAddress(host, port), 4000)
+                socket.soTimeout = 10000
                 val out = socket.getOutputStream()
                 out.write(zpl.toByteArray(Charsets.UTF_8))
                 out.flush()
             }
         } finally {
+            urgentPrintCount.decrementAndGet()
             printerLock.unlock()
         }
     }
@@ -227,6 +314,9 @@ object PrinterProtocol {
     }
 
     fun queryStatus(ip: String): HostStatus {
+        if (isPrinting() || isPrintPending()) {
+            return HostStatus(printingFormat = true)
+        }
         printerLock.lock()
         try {
             if (BlePrinterManager.isBluetoothTarget(ip)) {

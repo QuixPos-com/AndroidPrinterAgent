@@ -75,6 +75,7 @@ interface PrinterAgentNativeModule {
   getLogs(): Promise<string[]>;
   clearLogs(): Promise<boolean>;
   sendTestPrint(zpl: string): Promise<string>;
+  closeApp(): Promise<boolean>;
   addListener(eventName: string): void;
   removeListeners(count: number): void;
 }

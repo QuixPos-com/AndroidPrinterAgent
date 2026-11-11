@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  BackHandler,
   Platform,
   ScrollView,
   StatusBar,
@@ -77,12 +78,17 @@ function PrinterAgentMain(): React.JSX.Element {
   const [isRunning, setIsRunning] = useState<boolean>(false);
   const [isForegroundNotif, setIsForegroundNotif] = useState<boolean>(false);
 
-  const [logs, setLogs] = useState<string[]>([]);
   const [toastMsg, setToastMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(
     null,
   );
-  const logScrollRef = useRef<any>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const handleClose = useCallback(() => {
+    try {
+      PrinterAgent.closeApp?.();
+    } catch { }
+    BackHandler.exitApp();
+  }, []);
 
   const showToast = useCallback((text: string, type: 'success' | 'error' = 'success') => {
     if (toastTimerRef.current) {
@@ -136,11 +142,6 @@ function PrinterAgentMain(): React.JSX.Element {
 
       const snap = await PrinterAgent.getSnapshot();
       applySnapshot(snap);
-
-      const initialLogs = await PrinterAgent.getLogs();
-      if (Array.isArray(initialLogs)) {
-        setLogs(initialLogs.slice(-300));
-      }
     } catch (e: any) {
       showToast(`Initialisierungsfehler: ${e?.message || String(e)}`, 'error');
     }
@@ -148,14 +149,6 @@ function PrinterAgentMain(): React.JSX.Element {
 
   useEffect(() => {
     loadInitialState();
-
-    const logSub = PrinterAgentEvents.addListener('agent-log', (rawLine: any) => {
-      const line = String(rawLine || '');
-      setLogs(prev => {
-        const next = [...prev, line];
-        return next.length > 400 ? next.slice(next.length - 400) : next;
-      });
-    });
 
     const stateSub = PrinterAgentEvents.addListener('agent-state', (rawSnap: any) => {
       const snap = rawSnap as AgentSnapshot;
@@ -178,7 +171,6 @@ function PrinterAgentMain(): React.JSX.Element {
     }, 3000);
 
     return () => {
-      logSub.remove();
       stateSub.remove();
       clearInterval(statusPoll);
     };
@@ -306,7 +298,7 @@ function PrinterAgentMain(): React.JSX.Element {
   const handleAddBleAutoRow = async () => {
     try {
       await PrinterAgent.requestBluetoothPermissions();
-    } catch {}
+    } catch { }
     setPrinterRows(prev => {
       if (prev.some(r => r.trim().toLowerCase() === 'ble')) {
         return prev;
@@ -355,11 +347,6 @@ function PrinterAgentMain(): React.JSX.Element {
     }
   };
 
-  const handleClearLogs = async () => {
-    await PrinterAgent.clearLogs();
-    setLogs([]);
-  };
-
   return (
     <View
       style={[
@@ -383,36 +370,45 @@ function PrinterAgentMain(): React.JSX.Element {
             <Text style={styles.headerTitle}>QuixPosPrinterAgent</Text>
           </View>
         </View>
-        <View
-          style={[
-            styles.statusPill,
-            backendConnected
-              ? styles.pillOnline
-              : isPaired
-                ? styles.pillWarning
-                : styles.pillOffline,
-          ]}>
+        <View style={styles.headerRight}>
           <View
             style={[
-              styles.statusDot,
+              styles.statusPill,
               backendConnected
-                ? styles.dotOnline
+                ? styles.pillOnline
                 : isPaired
-                  ? styles.dotWarning
-                  : styles.dotOffline,
-            ]}
-          />
-          <Text
-            style={[
-              styles.statusPillText,
-              backendConnected
-                ? styles.textOnline
-                : isPaired
-                  ? styles.textWarning
-                  : styles.textOffline,
+                  ? styles.pillWarning
+                  : styles.pillOffline,
             ]}>
-            {backendConnected ? 'ONLINE' : isPaired ? 'VERBINDUNG...' : 'NICHT GEKOPPELT'}
-          </Text>
+            <View
+              style={[
+                styles.statusDot,
+                backendConnected
+                  ? styles.dotOnline
+                  : isPaired
+                    ? styles.dotWarning
+                    : styles.dotOffline,
+              ]}
+            />
+            <Text
+              style={[
+                styles.statusPillText,
+                backendConnected
+                  ? styles.textOnline
+                  : isPaired
+                    ? styles.textWarning
+                    : styles.textOffline,
+              ]}>
+              {backendConnected ? 'ONLINE' : isPaired ? 'VERBINDUNG...' : 'NICHT GEKOPPELT'}
+            </Text>
+          </View>
+          <TouchableOpacity
+            style={styles.headerCloseBtn}
+            onPress={handleClose}
+            accessibilityLabel="Schließen"
+            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+            <Text style={styles.headerCloseBtnText}>✕</Text>
+          </TouchableOpacity>
         </View>
       </View>
 
@@ -658,41 +654,10 @@ function PrinterAgentMain(): React.JSX.Element {
           </View>
         </View>
 
-        {/* Card 4: Live Agent Log Terminal */}
-        <View style={[styles.card, styles.logCard]}>
-          <View style={styles.cardHeaderRow}>
-            <Text style={styles.cardTitle}>LIVE-AGENT-PROTOKOLL ({logs.length})</Text>
-            <TouchableOpacity style={styles.btnSecondarySm} onPress={handleClearLogs}>
-              <Text style={styles.btnSecondaryText}>🗑️ Leeren</Text>
-            </TouchableOpacity>
-          </View>
-
-          <ScrollView
-            ref={logScrollRef}
-            style={styles.logTerminal}
-            nestedScrollEnabled
-            onContentSizeChange={() => logScrollRef.current?.scrollToEnd({ animated: true })}>
-            {logs.length === 0 ? (
-              <Text style={styles.logEmpty}>Warte auf Agent-Ausgabe...</Text>
-            ) : (
-              logs.map((line, i) => {
-                let color = '#cbd5e1';
-                if (line.includes('online') || line.includes('Successfully')) {
-                  color = '#4ade80';
-                } else if (line.includes('error') || line.includes('fail') || line.includes('unreachable')) {
-                  color = '#f87171';
-                } else if (line.includes('Local monitor') || line.includes('SSE connected')) {
-                  color = '#38bdf8';
-                }
-                return (
-                  <Text key={`log-${i}`} style={[styles.logLine, { color }]}>
-                    {line}
-                  </Text>
-                );
-              })
-            )}
-          </ScrollView>
-        </View>
+        {/* Close App Button */}
+        <TouchableOpacity style={styles.btnCloseApp} onPress={handleClose}>
+          <Text style={styles.btnCloseAppText}>Schließen</Text>
+        </TouchableOpacity>
       </ScrollView>
 
       {/* Toast Banner */}
@@ -1061,25 +1026,43 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
   },
-  logCard: {
-    minHeight: 160,
+  headerRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
   },
-  logTerminal: {
-    backgroundColor: '#090d16',
+  headerCloseBtn: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: '#1e293b',
+    borderWidth: 1,
+    borderColor: '#334155',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  headerCloseBtnText: {
+    color: '#94a3b8',
+    fontSize: 13,
+    fontWeight: '700',
+    lineHeight: 14,
+  },
+  btnCloseApp: {
+    backgroundColor: '#1e293b',
+    borderWidth: 1,
+    borderColor: '#334155',
     borderRadius: 8,
-    padding: 8,
-    height: 160,
+    paddingVertical: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 6,
+    marginBottom: 16,
   },
-  logEmpty: {
-    color: '#64748b',
-    fontFamily: monoFont,
-    fontSize: 11,
-  },
-  logLine: {
-    fontFamily: monoFont,
-    fontSize: 10,
-    lineHeight: 15,
-    marginBottom: 2,
+  btnCloseAppText: {
+    color: '#f8fafc',
+    fontSize: 13,
+    fontWeight: '700',
+    letterSpacing: 0.3,
   },
   toast: {
     position: 'absolute',
