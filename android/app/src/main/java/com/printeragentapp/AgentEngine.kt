@@ -5,7 +5,6 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
-import okhttp3.Call
 import okhttp3.ConnectionPool
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -13,40 +12,18 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.BufferedReader
-import java.io.InputStreamReader
-import java.net.URLDecoder
-import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
-import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.Executors
-import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantLock
 
-data class PrintJob(
-    val id: String,
-    val backendJobId: Int = 0,
-    val agentPrinterId: Int = 0,
-    val zpl: String = "",
-    val payloadFuture: CompletableFuture<String>? = null
-)
-
-data class SseEvent(
-    val id: String = "",
-    val event: String = "",
-    val data: String = ""
-)
-
-class AgentEngine private constructor(private val appContext: Context) {
+class AgentEngine private constructor(internal val appContext: Context) {
 
     interface AgentListener {
         fun onLog(line: String)
@@ -56,7 +33,6 @@ class AgentEngine private constructor(private val appContext: Context) {
 
     companion object {
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
-        private val EMPTY_BODY = ByteArray(0).toRequestBody(null)
 
         @Volatile
         private var instance: AgentEngine? = null
@@ -69,11 +45,10 @@ class AgentEngine private constructor(private val appContext: Context) {
     }
 
     private val mu = ReentrantLock()
-    private val stateMu = ReentrantLock()
     private val reloadMu = ReentrantLock()
 
     private val sharedConnectionPool = ConnectionPool(8, 5, TimeUnit.MINUTES)
-    private val httpClient: OkHttpClient = OkHttpClient.Builder()
+    internal val httpClient: OkHttpClient = OkHttpClient.Builder()
         .connectionPool(sharedConnectionPool)
         .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(10, TimeUnit.SECONDS)
@@ -81,51 +56,30 @@ class AgentEngine private constructor(private val appContext: Context) {
         .retryOnConnectionFailure(true)
         .build()
 
-    private val sseHttpClient: OkHttpClient = httpClient.newBuilder()
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(35, TimeUnit.SECONDS)
-        .build()
-
-    private val prefetchExecutor = Executors.newCachedThreadPool { r ->
-        Thread(r, "ZebraJobPrefetch").apply { isDaemon = true }
-    }
-    private val jobStatusExecutor = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "ZebraJobStatus").apply { isDaemon = true }
-    }
+    private val jobWorker = AgentJobWorker(this)
+    private val sseManager = AgentSseManager(this)
+    private val printerPoller = AgentPrinterPoller(this)
 
     private var cfg: AgentConfigData = AgentConfigStore.load(appContext)
     private val running = AtomicBoolean(false)
-    private val streamSignal = Object()
-    private val printerPollSignal = Object()
     private val lastPrintActivityMs = AtomicLong(0L)
     private val isPrinting = AtomicBoolean(false)
 
-    private val jobsQueue = LinkedBlockingQueue<PrintJob>(256)
-    private var seq = 0
     private var paired = cfg.token.isNotEmpty()
     private var agentId = cfg.agentId
     private var agentName = cfg.agentName
     private var backendConnected = false
     private var lastJob: JobReport? = null
     private var lastFault = ""
-    private var paperStatus = ""
     private var printerReady = false
     private var lastPrinterInfo = PrinterInfo(ip = cfg.printerIp)
-    private var lastPostedBody = ""
-    private var lastPostedTime = 0L
     private var lastReload = 0L
 
     private val printersInfo = ConcurrentHashMap<String, PrinterInfo>()
-    private val activeJobs = ConcurrentHashMap<Int, Boolean>()
-    private val cancelledJobs = ConcurrentHashMap<Int, Long>()
-    private val completedJobs = ConcurrentHashMap<Int, Long>()
-
     private val logs = ArrayDeque<String>(1000)
     private val listeners = CopyOnWriteArrayList<AgentListener>()
 
     private var monitorServer: LocalMonitorServer? = null
-    private val currentStreamCall = AtomicReference<Call?>(null)
-    private val workerReset = AtomicBoolean(false)
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     init {
@@ -185,7 +139,7 @@ class AgentEngine private constructor(private val appContext: Context) {
         }
     }
 
-    private fun broadcastEvent(type: String, data: Any?) {
+    internal fun broadcastEvent(type: String, data: Any?) {
         monitorServer?.broadcast(type, data)
         val snap = getSnapshot()
         for (l in listeners) {
@@ -197,7 +151,7 @@ class AgentEngine private constructor(private val appContext: Context) {
         }
     }
 
-    private fun notifyStateChanged() {
+    internal fun notifyStateChanged() {
         val snap = getSnapshot()
         for (l in listeners) {
             try {
@@ -214,9 +168,7 @@ class AgentEngine private constructor(private val appContext: Context) {
             val cb = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
                     if (running.get() && isPaired() && !isBackendConnected()) {
-                        synchronized(streamSignal) {
-                            streamSignal.notifyAll()
-                        }
+                        sseManager.wake()
                     }
                 }
             }
@@ -254,29 +206,12 @@ class AgentEngine private constructor(private val appContext: Context) {
 
         registerNetworkCallback()
 
-        // 1. Start Local Monitor Server
         val portNum = cfg.port.toIntOrNull() ?: 41783
         monitorServer = LocalMonitorServer(portNum, this).also { it.start() }
 
-        // 2. Start Printer Poller Thread
-        Thread({ printerPollerLoop() }, "ZebraPrinterPoller").apply {
-            isDaemon = true
-            start()
-        }
-
-        // 3. Start Job Worker Thread
-        Thread({ workerLoop() }, "ZebraJobWorker").apply {
-            isDaemon = true
-            priority = Thread.MAX_PRIORITY
-            start()
-        }
-
-        // 4. Start Upstream SSE Loop Thread
-        Thread({ sseMainLoop() }, "ZebraSseLoop").apply {
-            isDaemon = true
-            priority = Thread.MAX_PRIORITY
-            start()
-        }
+        printerPoller.start()
+        jobWorker.start()
+        sseManager.start()
 
         notifyStateChanged()
     }
@@ -287,10 +222,9 @@ class AgentEngine private constructor(private val appContext: Context) {
         }
         logf("ZebraAgent shutting down...")
         unregisterNetworkCallback()
-        currentStreamCall.getAndSet(null)?.cancel()
+        sseManager.stop()
         BlePrinterManager.disconnect()
-        synchronized(streamSignal) { streamSignal.notifyAll() }
-        synchronized(printerPollSignal) { printerPollSignal.notifyAll() }
+        printerPoller.wake()
         monitorServer?.stop()
         monitorServer = null
         mu.lock()
@@ -341,14 +275,31 @@ class AgentEngine private constructor(private val appContext: Context) {
         }
     }
 
+    internal fun setBackendConnected(connected: Boolean) {
+        mu.lock()
+        backendConnected = connected
+        mu.unlock()
+    }
+
     fun isPrinting(): Boolean {
         if (isPrinting.get()) return true
-        if (jobsQueue.isNotEmpty()) return true
-        if (activeJobs.isNotEmpty()) return true
+        if (jobWorker.hasPendingOrActiveJobs()) return true
         if (PrinterProtocol.isPrinting() || PrinterProtocol.isPrintPending()) return true
         if (System.currentTimeMillis() - lastPrintActivityMs.get() < 5000L) return true
         return false
     }
+
+    internal fun setPrinting(printing: Boolean) {
+        isPrinting.set(printing)
+    }
+
+    internal fun markPrintActivity() {
+        lastPrintActivityMs.set(System.currentTimeMillis())
+    }
+
+    internal fun getLastPrintActivityMs(): Long = lastPrintActivityMs.get()
+
+    internal fun hasPendingOrActiveJobs(): Boolean = jobWorker.hasPendingOrActiveJobs()
 
     fun setApiUrl(rawUrl: String) {
         val clean = AgentConfigStore.cleanApiUrl(rawUrl)
@@ -368,7 +319,7 @@ class AgentEngine private constructor(private val appContext: Context) {
         broadcastEvent("config", JSONObject().put("apiUrl", clean))
 
         if (changed) {
-            wakeStream()
+            sseManager.wake()
         }
     }
 
@@ -435,7 +386,7 @@ class AgentEngine private constructor(private val appContext: Context) {
 
             if (apiChanged) {
                 logf("ApiUrl changed; reconnecting backend stream...")
-                wakeStream()
+                sseManager.wake()
             }
 
             logf("Reconnecting to printers: ${newCfg.zplPrinters}...")
@@ -467,17 +418,7 @@ class AgentEngine private constructor(private val appContext: Context) {
         mu.unlock()
 
         broadcastEvent("printer", infoSnap.toJson())
-        synchronized(printerPollSignal) {
-            printerPollSignal.notifyAll()
-        }
-    }
-
-    private fun wakeStream() {
-        workerReset.set(true)
-        currentStreamCall.getAndSet(null)?.cancel()
-        synchronized(streamSignal) {
-            streamSignal.notifyAll()
-        }
+        printerPoller.wake()
     }
 
     fun pair(pin: String, optionalApiUrl: String? = null): JSONObject {
@@ -539,7 +480,7 @@ class AgentEngine private constructor(private val appContext: Context) {
             agentName = name
             mu.unlock()
 
-            wakeStream()
+            sseManager.wake()
 
             val resultObj = JSONObject().apply {
                 put("success", true)
@@ -565,7 +506,7 @@ class AgentEngine private constructor(private val appContext: Context) {
         mu.unlock()
 
         AgentConfigStore.savePairing(appContext, "", "", 0)
-        wakeStream()
+        sseManager.wake()
 
         broadcastEvent("unpaired", JSONObject().put("reason", "unauthorized"))
         logf("Agent unpaired (token cleared). Waiting for pairing PIN...")
@@ -583,10 +524,111 @@ class AgentEngine private constructor(private val appContext: Context) {
     }
 
     fun enqueueJob(job: PrintJob) {
-        reportState(job.id, "queued", "")
-        if (!jobsQueue.offer(job)) {
-            reportState(job.id, "error", "agent queue full")
+        jobWorker.enqueueJob(job)
+    }
+
+    internal fun handleJobCreated(jobId: Int, agentPrinterId: Int, data: String) {
+        jobWorker.handleJobCreated(jobId, agentPrinterId, data)
+    }
+
+    internal fun cancelJob(jobId: Int) {
+        jobWorker.cancelJob(jobId)
+    }
+
+    internal fun drainBacklog() {
+        jobWorker.drainBacklog()
+    }
+
+    internal fun sendPrinterStateUpstream() {
+        printerPoller.sendPrinterStateUpstream()
+    }
+
+    internal fun updateAgentIdentity(aid: Int, aname: String) {
+        mu.lock()
+        if (aid != 0) {
+            agentId = aid
+            cfg.agentId = aid
         }
+        if (aname.isNotEmpty()) {
+            agentName = aname
+            cfg.agentName = aname
+        }
+        val tokenToSave = cfg.token
+        val nameToSave = agentName
+        val idToSave = agentId
+        mu.unlock()
+
+        if (nameToSave.isNotEmpty()) {
+            AgentConfigStore.savePairing(appContext, tokenToSave, nameToSave, idToSave)
+        }
+    }
+
+    internal fun getPrimaryPrinterInfo(): PrinterInfo {
+        mu.lock()
+        return try {
+            lastPrinterInfo
+        } finally {
+            mu.unlock()
+        }
+    }
+
+    internal fun updatePrimaryPrinterInfo(info: PrinterInfo) {
+        mu.lock()
+        lastPrinterInfo = info
+        printerReady = info.ready
+        printersInfo[info.ip] = info
+        mu.unlock()
+    }
+
+    internal fun updateSecondaryPrinterInfo(ip: String, info: PrinterInfo): Boolean {
+        val prev = printersInfo.put(ip, info)
+        return prev == null || prev != info
+    }
+
+    internal fun getPrinterInfo(ip: String): PrinterInfo? {
+        return printersInfo[ip]
+    }
+
+    internal fun setLastFault(fault: String) {
+        mu.lock()
+        lastFault = fault
+        mu.unlock()
+    }
+
+    internal fun getLastFault(): String {
+        mu.lock()
+        return try {
+            lastFault
+        } finally {
+            mu.unlock()
+        }
+    }
+
+    internal fun getLastJob(): JobReport? {
+        mu.lock()
+        return try {
+            lastJob
+        } finally {
+            mu.unlock()
+        }
+    }
+
+    internal fun reportJobState(jobId: String, jobState: String, detail: String) {
+        logf("job $jobId: $jobState $detail")
+        mu.lock()
+        lastJob = JobReport(id = jobId, state = jobState, detail = detail, updatedAt = isoNow())
+        mu.unlock()
+
+        broadcastEvent(
+            "job",
+            JSONObject().apply {
+                put("jobId", jobId)
+                put("state", jobState)
+                put("detail", detail)
+            }
+        )
+
+        Thread { printerPoller.postStatePayload(jobId, jobState, detail, true) }.start()
     }
 
     fun getSnapshot(): JSONObject {
@@ -682,933 +724,5 @@ class AgentEngine private constructor(private val appContext: Context) {
 
         val summary = parts.joinToString("\n")
         return Pair(title, summary)
-    }
-
-    // =========================================================================
-    // Upstream SSE Event Stream (replicates service/sse.go & service/main.go)
-    // =========================================================================
-    private fun sseMainLoop() {
-        var lastId = ""
-        var backoffMs = 1000L
-        var everConnected = false
-
-        while (running.get()) {
-            val cfgSnap = getConfigSnapshot()
-            if (cfgSnap.apiUrl.isEmpty()) {
-                logf("ApiUrl not set. Waiting for ApiUrl configuration...")
-                synchronized(streamSignal) {
-                    try {
-                        streamSignal.wait(5000)
-                    } catch (_: InterruptedException) {
-                    }
-                }
-                continue
-            }
-
-            if (!isPaired()) {
-                logf("ZebraAgent waiting for pairing PIN...")
-                synchronized(streamSignal) {
-                    try {
-                        streamSignal.wait(5000)
-                    } catch (_: InterruptedException) {
-                    }
-                }
-                continue
-            }
-
-            workerReset.set(false)
-            val baseReqUrl = cfgSnap.endpoint("/events")
-            if (everConnected) {
-                logf("SSE reconnecting to $baseReqUrl...")
-            } else {
-                logf("SSE connecting to $baseReqUrl...")
-            }
-
-            val startTime = System.currentTimeMillis()
-            var connectedOnce = false
-
-            try {
-                readSseStream(
-                    cfgSnap = cfgSnap,
-                    lastIdRef = { lastId },
-                    setLastId = { lastId = it },
-                    onConnected = { connState ->
-                        if (connState) {
-                            connectedOnce = true
-                            everConnected = true
-                            backoffMs = 1000L
-                        }
-                        mu.lock()
-                        backendConnected = connState
-                        mu.unlock()
-                        broadcastEvent("connection", JSONObject().put("connected", connState))
-                    }
-                )
-            } catch (u: UnauthorizedException) {
-                logf("SSE authentication failed (${u.message}). Token invalid or revoked.")
-                unpair()
-                continue
-            } catch (e: Exception) {
-                if (running.get() && !workerReset.get()) {
-                    if (!connectedOnce && !everConnected) {
-                        logf("SSE initial connection failed: ${e.message} (retrying in ${backoffMs / 1000}s)")
-                    } else {
-                        logf("SSE disconnected: ${e.message} (reconnecting in ${backoffMs / 1000}s)")
-                    }
-                }
-            } finally {
-                mu.lock()
-                backendConnected = false
-                mu.unlock()
-                broadcastEvent("connection", JSONObject().put("connected", false))
-            }
-
-            if (!running.get()) break
-            if (workerReset.get() || !isPaired()) continue
-
-            if (connectedOnce && (System.currentTimeMillis() - startTime) > 35_000L) {
-                backoffMs = 1000L
-            }
-
-            synchronized(streamSignal) {
-                try {
-                    streamSignal.wait(backoffMs)
-                } catch (_: InterruptedException) {
-                }
-            }
-            if (backoffMs < 30_000L) {
-                backoffMs = (backoffMs * 2).coerceAtMost(30_000L)
-            }
-        }
-    }
-
-    private class UnauthorizedException(msg: String) : Exception(msg)
-
-    private fun readSseStream(
-        cfgSnap: AgentConfigData,
-        lastIdRef: () -> String,
-        setLastId: (String) -> Unit,
-        onConnected: (Boolean) -> Unit
-    ) {
-        val base = cfgSnap.endpoint("/events")
-        val sep = if (base.contains("?")) "&" else "?"
-        val fullUrl = "${base}${sep}token=${URLEncoder.encode(cfgSnap.token, "UTF-8")}&agentversion=${AgentConfigStore.AGENT_VERSION}"
-
-        val reqBuilder = Request.Builder()
-            .url(fullUrl)
-            .get()
-            .header("Authorization", "Bearer ${cfgSnap.token}")
-            .header("agentversion", AgentConfigStore.AGENT_VERSION)
-            .header("Accept", "text/event-stream")
-            .header("Cache-Control", "no-cache")
-
-        val lid = lastIdRef()
-        if (lid.isNotEmpty()) {
-            reqBuilder.header("Last-Event-ID", lid)
-        }
-
-        val call = sseHttpClient.newCall(reqBuilder.build())
-        currentStreamCall.set(call)
-        try {
-            call.execute().use { resp ->
-                val code = resp.code
-                if (code == 401) {
-                    val errBody = resp.body?.string() ?: ""
-                    throw UnauthorizedException("HTTP 401: ${errBody.trim()}")
-                }
-                if (code != 200) {
-                    val errBody = resp.body?.string() ?: ""
-                    throw Exception("HTTP $code: ${errBody.trim()}")
-                }
-
-                val body = resp.body ?: throw Exception("empty SSE response body")
-                logf("SSE connected to $base")
-                onConnected(true)
-
-                val reader = BufferedReader(InputStreamReader(body.byteStream(), Charsets.UTF_8), 1024)
-                var evId = ""
-                var evType = ""
-                val dataLines = ArrayList<String>()
-
-                while (running.get() && !workerReset.get()) {
-                    val rawLine = reader.readLine() ?: break
-                    val line = rawLine.trimEnd('\r', '\n')
-
-                    when {
-                        line.isEmpty() -> {
-                            if (dataLines.isNotEmpty() || evType.isNotEmpty()) {
-                                val dataStr = dataLines.joinToString("\n")
-                                if (evId.isNotEmpty()) {
-                                    setLastId(evId)
-                                }
-                                handleSseEvent(SseEvent(id = evId, event = evType, data = dataStr))
-                            }
-                            evId = ""
-                            evType = ""
-                            dataLines.clear()
-                        }
-                        line.startsWith(":") -> {
-                            // Heartbeat comment frame ": heartbeat"
-                        }
-                        else -> {
-                            val colonIdx = line.indexOf(':')
-                            val field = if (colonIdx != -1) line.substring(0, colonIdx) else line
-                            var value = if (colonIdx != -1) line.substring(colonIdx + 1) else ""
-                            if (value.startsWith(" ")) {
-                                value = value.substring(1)
-                            }
-                            when (field) {
-                                "data" -> dataLines.add(value)
-                                "id" -> evId = value
-                                "event" -> evType = value
-                            }
-                        }
-                    }
-                }
-            }
-        } finally {
-            currentStreamCall.compareAndSet(call, null)
-            call.cancel()
-        }
-    }
-
-    private fun handleSseEvent(ev: SseEvent) {
-        if (ev.event == "connected") {
-            logf("Backend SSE event: connected, ${ev.data}")
-            try {
-                val obj = JSONObject(ev.data)
-                val aid = obj.optInt("agentId", 0)
-                val aname = obj.optString("name", "")
-                mu.lock()
-                if (aid != 0) {
-                    agentId = aid
-                    cfg.agentId = aid
-                }
-                if (aname.isNotEmpty()) {
-                    agentName = aname
-                    cfg.agentName = aname
-                }
-                val tokenToSave = cfg.token
-                val nameToSave = agentName
-                val idToSave = agentId
-                mu.unlock()
-                if (nameToSave.isNotEmpty()) {
-                    AgentConfigStore.savePairing(appContext, tokenToSave, nameToSave, idToSave)
-                }
-            } catch (_: Exception) {
-            }
-
-            Thread { sendPrinterStateUpstream() }.start()
-            Thread { drainBacklog() }.start()
-            notifyStateChanged()
-            return
-        }
-
-        // Check cancel event
-        val cancelParsed = parseCancelEvent(ev)
-        if (cancelParsed != null) {
-            val (model, serial, pType) = cancelParsed
-            logf("Backend SSE event: cancel (model=\"$model\" serial=\"$serial\" type=\"$pType\")")
-            Thread { handleCancel(model, serial, pType) }.start()
-            return
-        }
-
-        // Check real-time job notifications ("job", "printerjob", or payload with "action")
-        val jobEv = parseJobEvent(ev)
-        if (jobEv != null) {
-            val action = jobEv.optString("action", "")
-            val jobId = jobEv.optInt("jobId", 0)
-            val agentPrinterId = jobEv.optInt("agentprinterId", 0)
-            val jobType = jobEv.optString("type", "")
-
-            if (action.equals("cancelled", ignoreCase = true)) {
-                logf("Backend SSE event: job cancelled (jobId=$jobId agentprinterId=$agentPrinterId)")
-                cancelJob(jobId)
-                return
-            }
-            if (action.equals("created", ignoreCase = true)) {
-                val inlineData = jobEv.optString("data", "").ifEmpty { jobEv.optString("zpl", "") }
-                logf("Backend SSE event: job created (jobId=$jobId agentprinterId=$agentPrinterId type=\"$jobType\")")
-                handleJobCreated(jobId, agentPrinterId, inlineData)
-                return
-            }
-        }
-
-        val trimmed = ev.data.trim()
-        if (trimmed.isEmpty()) return
-
-        // Parse "print <zpl>"
-        val spaceIdx = trimmed.indexOf(' ')
-        val cmd = if (spaceIdx != -1) trimmed.substring(0, spaceIdx) else trimmed
-        val arg = if (spaceIdx != -1) trimmed.substring(spaceIdx + 1) else ""
-        if (cmd.equals("print", ignoreCase = true)) {
-            mu.lock()
-            val id = ev.id.ifEmpty {
-                seq++
-                "local-${System.currentTimeMillis() / 1000}-$seq"
-            }
-            mu.unlock()
-            enqueueJob(PrintJob(id = id, zpl = arg))
-            return
-        }
-
-        logf("unknown message: ${ev.data.take(80)}")
-    }
-
-    private fun parseJobEvent(ev: SseEvent): JSONObject? {
-        val isJobEvent = ev.event.equals("job", ignoreCase = true) || ev.event.equals("printerjob", ignoreCase = true)
-        val trimmed = ev.data.trim()
-        if (!isJobEvent && !trimmed.contains("\"action\"")) {
-            return null
-        }
-        return try {
-            val obj = JSONObject(trimmed)
-            if (obj.optString("action", "").isNotEmpty() && obj.optInt("jobId", 0) > 0) obj else null
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    private fun parseCancelEvent(ev: SseEvent): Triple<String, String, String>? {
-        val isCancelEvent = ev.event.equals("cancel", ignoreCase = true)
-        val trimmed = ev.data.trim()
-        if (!isCancelEvent && !trimmed.lowercase().startsWith("cancel")) {
-            return null
-        }
-        var payload = trimmed
-        if (payload.lowercase().startsWith("cancel")) {
-            payload = payload.substring(6).trim()
-        }
-        if (payload.isEmpty()) {
-            return Triple("", "", "")
-        }
-
-        try {
-            val obj = JSONObject(payload)
-            val m = obj.optString("model").ifEmpty { obj.optString("clientmodel").ifEmpty { obj.optString("printerModel") } }
-            val s = obj.optString("serial").ifEmpty { obj.optString("clientserial").ifEmpty { obj.optString("printerSerial") } }
-            val t = obj.optString("type").ifEmpty { obj.optString("clienttype").ifEmpty { obj.optString("printerType") } }
-            return Triple(m, s, t)
-        } catch (_: Exception) {
-        }
-
-        if (payload.contains("=")) {
-            val map = HashMap<String, String>()
-            for (pair in payload.split("&")) {
-                val kv = pair.split("=", limit = 2)
-                if (kv.size == 2) {
-                    map[URLDecoder.decode(kv[0], "UTF-8")] = URLDecoder.decode(kv[1], "UTF-8")
-                }
-            }
-            if (map.containsKey("model") || map.containsKey("serial") || map.containsKey("type")) {
-                return Triple(map["model"] ?: "", map["serial"] ?: "", map["type"] ?: "")
-            }
-        }
-
-        val parts = payload.split(Regex("\\s+"))
-        return when {
-            parts.size >= 3 -> Triple(parts[0], parts[1], parts[2])
-            parts.size == 2 -> Triple(parts[0], parts[1], "")
-            parts.size == 1 -> Triple("", parts[0], "")
-            else -> Triple("", "", "")
-        }
-    }
-
-    private fun handleCancel(reqModel: String, reqSerial: String, reqType: String) {
-        val printers = getPrinters()
-        val ip = printers.firstOrNull() ?: ""
-        if (ip.isEmpty()) {
-            logf("Cancel ignored: no printer IP configured")
-            return
-        }
-
-        mu.lock()
-        var currentModel = lastPrinterInfo.model
-        var currentSerial = lastPrinterInfo.serial
-        mu.unlock()
-
-        if (currentModel.isEmpty() && currentSerial.isEmpty()) {
-            val info = PrinterProtocol.queryPrinterInfo(ip)
-            mu.lock()
-            lastPrinterInfo = info
-            currentModel = info.model
-            currentSerial = info.serial
-            mu.unlock()
-        }
-
-        if (reqType.isNotEmpty() && !reqType.equals("zpl", ignoreCase = true)) {
-            logf("Cancel ignored: type mismatch (event requested \"$reqType\", printer has \"zpl\")")
-            return
-        }
-        if (reqSerial.isNotEmpty() && currentSerial.isNotEmpty() && !reqSerial.equals(currentSerial, ignoreCase = true)) {
-            logf("Cancel ignored: serial mismatch (event requested \"$reqSerial\", printer has \"$currentSerial\")")
-            return
-        }
-        if (reqModel.isNotEmpty() && currentModel.isNotEmpty() && !reqModel.equals(currentModel, ignoreCase = true)) {
-            logf("Cancel ignored: model mismatch (event requested \"$reqModel\", printer has \"$currentModel\")")
-            return
-        }
-
-        logf("Executing cancel (model=\"$reqModel\" serial=\"$reqSerial\" type=\"zpl\"): sending ~JP to printer $ip")
-        try {
-            val startTime = System.currentTimeMillis()
-            PrinterProtocol.sendZPL(ip, "~JP")
-            val elapsed = System.currentTimeMillis() - startTime
-            logf("Successfully sent ~JP to printer $ip in ${elapsed}ms")
-            broadcastEvent(
-                "cancel",
-                JSONObject().apply {
-                    put("model", reqModel)
-                    put("serial", reqSerial)
-                    put("type", "zpl")
-                    put("status", "cancelled")
-                }
-            )
-        } catch (e: Exception) {
-            logf("Failed to send ~JP to printer $ip: ${e.message}")
-        }
-    }
-
-    // =========================================================================
-    // Print Job Worker & Lifecycle (replicates worker, runJob, runBackendJob)
-    // =========================================================================
-    private fun workerLoop() {
-        while (running.get()) {
-            val job = try {
-                jobsQueue.poll(1, TimeUnit.SECONDS)
-            } catch (_: InterruptedException) {
-                null
-            } ?: continue
-
-            isPrinting.set(true)
-            PrinterProtocol.setPrinting(true)
-            lastPrintActivityMs.set(System.currentTimeMillis())
-            try {
-                if (job.backendJobId > 0) {
-                    runBackendJob(job)
-                } else {
-                    runDirectJob(job)
-                }
-            } finally {
-                lastPrintActivityMs.set(System.currentTimeMillis())
-                isPrinting.set(false)
-                PrinterProtocol.setPrinting(false)
-            }
-        }
-    }
-
-    private fun runDirectJob(j: PrintJob) {
-        val ip = getPrinters().firstOrNull() ?: ""
-        if (ip.isEmpty()) {
-            reportState(j.id, "error", "no printer IP configured")
-            return
-        }
-        logf("Writing print job ${j.id} (${j.zpl.length} bytes) to printer $ip...")
-        val startTime = System.currentTimeMillis()
-        try {
-            PrinterProtocol.sendZPL(ip, j.zpl)
-        } catch (e: Exception) {
-            val elapsed = System.currentTimeMillis() - startTime
-            logf("Failed to send job ${j.id} to printer $ip after ${elapsed}ms: ${e.message}")
-            reportState(j.id, "error", "send failed: ${e.message}")
-            return
-        }
-        val elapsed = System.currentTimeMillis() - startTime
-        logf("Time spent sending job ${j.id} to printer $ip: ${elapsed}ms")
-        reportState(j.id, "sent", "")
-
-        // Non-intrusive pause for physical print without polling status while printing
-        try {
-            Thread.sleep(2000L)
-        } catch (_: InterruptedException) {
-            return
-        }
-        reportState(j.id, "done", "")
-    }
-
-    private fun runBackendJob(j: PrintJob) {
-        val jobId = j.backendJobId
-        if (cancelledJobs.containsKey(jobId)) {
-            logf("Job $jobId was cancelled before execution, discarding.")
-            finishJob(jobId)
-            return
-        }
-
-        // Signal background status poller immediately so printer lock is free by the time ZPL is ready
-        BlePrinterManager.abortActiveQuery()
-
-        var zpl = j.zpl
-        if (zpl.isEmpty()) {
-            zpl = try {
-                val prefetched = j.payloadFuture
-                if (prefetched != null) {
-                    try {
-                        prefetched.get(10, TimeUnit.SECONDS)
-                    } catch (e: Exception) {
-                        throw (e.cause ?: e)
-                    }
-                } else {
-                    fetchJobPayload(jobId)
-                }
-            } catch (e: Throwable) {
-                logf("Failed to fetch payload for job $jobId: ${e.message}")
-                jobStatusExecutor.execute { patchJobFailed(jobId) }
-                reportState(j.id, "error", "fetch failed: ${e.message}")
-                finishJob(jobId)
-                return
-            }
-        }
-
-        if (cancelledJobs.containsKey(jobId)) {
-            logf("Job $jobId was cancelled during fetch, discarding.")
-            finishJob(jobId)
-            return
-        }
-
-        val ip = getPrinters().firstOrNull() ?: ""
-        if (ip.isEmpty()) {
-            logf("Failed to execute job $jobId: no printer IP configured")
-            jobStatusExecutor.execute { patchJobFailed(jobId) }
-            reportState(j.id, "error", "no printer IP configured")
-            finishJob(jobId)
-            return
-        }
-
-        // Dispatch "processing" status asynchronously on sequential jobStatusExecutor
-        // so sending ZPL to the printer starts immediately without waiting for an HTTP round-trip
-        jobStatusExecutor.execute { markJobProcessing(jobId) }
-        reportState(j.id, "processing", "")
-
-        logf("Writing print job $jobId (${zpl.length} bytes) to printer $ip...")
-        val startTime = System.currentTimeMillis()
-        try {
-            PrinterProtocol.sendZPL(ip, zpl)
-        } catch (e: Exception) {
-            val elapsed = System.currentTimeMillis() - startTime
-            logf("Failed to send job $jobId to printer $ip after ${elapsed}ms: ${e.message}")
-            jobStatusExecutor.execute { patchJobFailed(jobId) }
-            reportState(j.id, "error", "send failed: ${e.message}")
-            finishJob(jobId)
-            return
-        }
-        val elapsed = System.currentTimeMillis() - startTime
-        logf("Time spent sending job $jobId to printer $ip: ${elapsed}ms")
-
-        jobStatusExecutor.execute { markJobCompleted(jobId) }
-        reportState(j.id, "completed", "")
-        logf("Job $jobId successfully completed.")
-        finishJob(jobId)
-    }
-
-    private fun handleJobCreated(jobId: Int, agentPrinterId: Int, data: String) {
-        if (jobId <= 0) return
-        if (activeJobs.containsKey(jobId) || completedJobs.containsKey(jobId)) return
-        if (cancelledJobs.containsKey(jobId)) {
-            logf("Job $jobId was cancelled, skipping creation.")
-            return
-        }
-        activeJobs[jobId] = true
-        lastPrintActivityMs.set(System.currentTimeMillis())
-        BlePrinterManager.abortActiveQuery()
-
-        // Start fetching the job payload immediately in parallel while the job enters the queue
-        val future = if (data.isEmpty()) {
-            CompletableFuture.supplyAsync({ fetchJobPayload(jobId) }, prefetchExecutor)
-        } else {
-            null
-        }
-
-        val job = PrintJob(
-            id = jobId.toString(),
-            backendJobId = jobId,
-            agentPrinterId = agentPrinterId,
-            zpl = data,
-            payloadFuture = future
-        )
-        if (!jobsQueue.offer(job)) {
-            logf("Agent job queue full, cannot enqueue job $jobId")
-            future?.cancel(true)
-            jobStatusExecutor.execute { patchJobFailed(jobId) }
-            finishJob(jobId)
-        }
-    }
-
-    private fun cancelJob(jobId: Int) {
-        val now = System.currentTimeMillis()
-        cancelledJobs[jobId] = now
-        activeJobs.remove(jobId)
-        cleanupJobMaps(now)
-        logf("Job $jobId cancelled by user.")
-        broadcastEvent("job", JSONObject().put("id", jobId.toString()).put("state", "cancelled"))
-    }
-
-    private fun finishJob(jobId: Int) {
-        val now = System.currentTimeMillis()
-        activeJobs.remove(jobId)
-        completedJobs[jobId] = now
-        cleanupJobMaps(now)
-    }
-
-    private fun cleanupJobMaps(now: Long) {
-        val expiry = 10 * 60 * 1000L
-        cancelledJobs.entries.removeIf { now - it.value > expiry }
-        completedJobs.entries.removeIf { now - it.value > expiry }
-    }
-
-    private fun fetchJobPayload(jobId: Int): String {
-        val cfgSnap = getConfigSnapshot()
-        if (cfgSnap.token.isEmpty()) throw Exception("no auth token")
-        val reqUrl = cfgSnap.endpoint("jobs/$jobId")
-        val request = Request.Builder()
-            .url(reqUrl)
-            .get()
-            .header("Authorization", "Bearer ${cfgSnap.token}")
-            .header("agentversion", AgentConfigStore.AGENT_VERSION)
-            .build()
-
-        httpClient.newCall(request).execute().use { resp ->
-            val code = resp.code
-            val text = resp.body?.string() ?: ""
-            if (code != 200) {
-                throw Exception("HTTP $code: ${text.trim()}")
-            }
-            val json = JSONObject(text)
-            return json.optJSONObject("job")?.optString("data", "") ?: ""
-        }
-    }
-
-    private fun markJobProcessing(jobId: Int) {
-        postJobEndpoint("jobs/$jobId/processing", "POST", null)
-    }
-
-    private fun markJobCompleted(jobId: Int) {
-        postJobEndpoint("jobs/$jobId/completed", "POST", null)
-    }
-
-    private fun patchJobFailed(jobId: Int) {
-        postJobEndpoint("jobs/$jobId", "PATCH", JSONObject().put("state", "failed").toString())
-    }
-
-    private fun postJobEndpoint(subpath: String, method: String, body: String?) {
-        val cfgSnap = getConfigSnapshot()
-        if (cfgSnap.token.isEmpty()) return
-        val reqUrl = cfgSnap.endpoint(subpath)
-        val reqBody = body?.toRequestBody(JSON_MEDIA_TYPE) ?: EMPTY_BODY
-        val reqBuilder = Request.Builder()
-            .url(reqUrl)
-            .header("Authorization", "Bearer ${cfgSnap.token}")
-            .header("agentversion", AgentConfigStore.AGENT_VERSION)
-
-        if (method == "PATCH") {
-            reqBuilder.patch(reqBody)
-        } else {
-            reqBuilder.method(method, reqBody)
-        }
-
-        try {
-            httpClient.newCall(reqBuilder.build()).execute().use { resp ->
-                val code = resp.code
-                if (code >= 300) {
-                    val err = resp.body?.string() ?: ""
-                    logf("$subpath HTTP $code: ${err.trim()}")
-                }
-            }
-        } catch (e: Exception) {
-            logf("$subpath error: ${e.message}")
-        }
-    }
-
-    private fun drainBacklog() {
-        val cfgSnap = getConfigSnapshot()
-        if (cfgSnap.token.isEmpty()) return
-        val reqUrl = cfgSnap.endpoint("jobs?state=pending")
-        val request = Request.Builder()
-            .url(reqUrl)
-            .get()
-            .header("Authorization", "Bearer ${cfgSnap.token}")
-            .header("agentversion", AgentConfigStore.AGENT_VERSION)
-            .build()
-
-        try {
-            httpClient.newCall(request).execute().use { resp ->
-                val code = resp.code
-                val body = resp.body?.string() ?: ""
-                if (code != 200) {
-                    logf("drainBacklog HTTP $code: ${body.trim()}")
-                    return
-                }
-                val json = JSONObject(body)
-                val jobsArr = json.optJSONArray("jobs") ?: return
-                if (jobsArr.length() > 0) {
-                    logf("Processing ${jobsArr.length()} pending jobs from backlog...")
-                    for (i in 0 until jobsArr.length()) {
-                        val j = jobsArr.optJSONObject(i) ?: continue
-                        handleJobCreated(
-                            jobId = j.optInt("id", 0),
-                            agentPrinterId = j.optInt("agentprinterId", 0),
-                            data = j.optString("data", "")
-                        )
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            logf("drainBacklog error: ${e.message}")
-        }
-    }
-
-    // =========================================================================
-    // Printer Poller & Upstream State Reporting
-    // =========================================================================
-    private fun printerPollerLoop() {
-        var lastInfo = PrinterInfo(ip = "")
-        var hasPolledOnce = false
-        var wasPrinting = false
-
-        while (running.get()) {
-            try {
-                if (isPrinting()) {
-                    if (!wasPrinting) {
-                        wasPrinting = true
-                        logf("Printer is printing; status polling paused.")
-                    }
-                } else {
-                    if (wasPrinting) {
-                        wasPrinting = false
-                        logf("Printing finished; resuming status polling.")
-                    }
-                    checkAndReportPrinter(
-                        lastInfo = lastInfo,
-                        hasPolledOnce = hasPolledOnce,
-                        updateTrackers = { newLast, polled ->
-                            lastInfo = newLast
-                            hasPolledOnce = polled
-                        }
-                    )
-                }
-            } catch (e: Exception) {
-                logf("Printer poller error: ${e.message}")
-            }
-
-            synchronized(printerPollSignal) {
-                try {
-                    val waitMs = if (isPrinting()) 2000L else 5000L
-                    printerPollSignal.wait(waitMs)
-                } catch (_: InterruptedException) {
-                }
-            }
-        }
-    }
-
-    private fun checkAndReportPrinter(
-        lastInfo: PrinterInfo,
-        hasPolledOnce: Boolean,
-        updateTrackers: (PrinterInfo, Boolean) -> Unit
-    ) {
-        if (isPrinting()) return
-        if (jobsQueue.isNotEmpty() || activeJobs.isNotEmpty() || PrinterProtocol.isPrintPending() || PrinterProtocol.isPrinting()) return
-        if (System.currentTimeMillis() - lastPrintActivityMs.get() < 5000L) return
-
-        val printers = getPrinters()
-        if (printers.isEmpty()) return
-
-        val primaryIp = printers[0]
-        val (info, ok) = PrinterProtocol.tryQueryPrinterInfo(primaryIp)
-        if (!ok) return
-
-        mu.lock()
-        lastPrinterInfo = info
-        printerReady = info.ready
-        printersInfo[primaryIp] = info
-        mu.unlock()
-
-        for (secIp in printers.drop(1)) {
-            if (isPrinting()) break
-            if (jobsQueue.isNotEmpty() || activeJobs.isNotEmpty() || PrinterProtocol.isPrintPending() || PrinterProtocol.isPrinting()) break
-            val (secInfo, secOk) = PrinterProtocol.tryQueryPrinterInfo(secIp)
-            if (secOk) {
-                val prevSec = printersInfo.put(secIp, secInfo)
-                val secChanged = prevSec == null || prevSec != secInfo
-                if (secChanged) {
-                    broadcastEvent("printer", secInfo.toJson())
-                }
-            }
-        }
-
-        mu.lock()
-        lastFault = when {
-            info.errors.headOpen -> "head open"
-            info.errors.pause -> "paused"
-            info.errors.other -> "printer error"
-            info.errors.unreachable -> "unreachable"
-            else -> ""
-        }
-        mu.unlock()
-
-        val isInitialPoll = !hasPolledOnce
-        val changed = isInitialPoll || lastInfo != info
-
-        if (changed) {
-            updateTrackers(info, true)
-            broadcastEvent("printer", info.toJson())
-
-            val labelLenStr = info.labelLength?.toString() ?: "null"
-            logf(
-                "Printer [${info.ip}] status: ${info.status} (model=\"${info.model}\" serial=\"${info.serial}\" labelLength=$labelLenStr headOpen=${info.errors.headOpen} pause=${info.errors.pause} other=${info.errors.other} unreachable=${info.errors.unreachable})"
-            )
-
-            if (isPaired() && isBackendConnected()) {
-                Thread { postStatePayload("", "", "", isInitialPoll) }.start()
-            }
-        }
-    }
-
-    private fun sendPrinterStateUpstream() {
-        val ip = getPrinters().firstOrNull() ?: return
-        mu.lock()
-        val hasInfo = lastPrinterInfo.ip.isNotEmpty()
-        mu.unlock()
-
-        if (!hasInfo) {
-            val info = PrinterProtocol.queryPrinterInfo(ip)
-            mu.lock()
-            lastPrinterInfo = info
-            printerReady = info.ready
-            printersInfo[ip] = info
-            mu.unlock()
-        }
-
-        logf("Sending printer state upstream after SSE connection...")
-        postStatePayload("", "", "", true)
-    }
-
-    private fun reportState(jobId: String, jobState: String, detail: String) {
-        logf("job $jobId: $jobState $detail")
-        mu.lock()
-        lastJob = JobReport(id = jobId, state = jobState, detail = detail, updatedAt = isoNow())
-        mu.unlock()
-
-        broadcastEvent(
-            "job",
-            JSONObject().apply {
-                put("jobId", jobId)
-                put("state", jobState)
-                put("detail", detail)
-            }
-        )
-
-        Thread { postStatePayload(jobId, jobState, detail, true) }.start()
-    }
-
-    private fun postStatePayload(jobId: String, jobState: String, detail: String, force: Boolean) {
-        stateMu.lock()
-        try {
-            mu.lock()
-            val cfgSnap = cfg.copy(zplPrinters = ArrayList(cfg.zplPrinters))
-            val connected = backendConnected
-            val fault = lastFault
-            val info = lastPrinterInfo
-            val jobCopy = lastJob
-            mu.unlock()
-
-            if (cfgSnap.token.isEmpty() || !connected) return
-
-            val printers = getPrinters()
-            val printersList = JSONArray()
-            for (p in printers) {
-                val pInfo = printersInfo[p] ?: info
-                printersList.put(
-                    JSONObject().apply {
-                        put("serial", pInfo.serial)
-                        put("model", pInfo.model)
-                        put("type", "zpl")
-                        if (pInfo.labelLength != null) {
-                            put("labelLength", pInfo.labelLength)
-                        } else {
-                            put("labelLength", JSONObject.NULL)
-                        }
-                        put("errors", pInfo.errors.toJson())
-                    }
-                )
-            }
-            if (printersList.length() == 0) {
-                printersList.put(
-                    JSONObject().apply {
-                        put("serial", info.serial)
-                        put("model", info.model)
-                        put("type", "zpl")
-                        if (info.labelLength != null) {
-                            put("labelLength", info.labelLength)
-                        } else {
-                            put("labelLength", JSONObject.NULL)
-                        }
-                        put("errors", info.errors.toJson())
-                    }
-                )
-            }
-
-            val stateMap = JSONObject().apply {
-                put("printers", printersList)
-                if (fault.isNotEmpty()) {
-                    put("fault", fault)
-                }
-                if (jobId.isNotEmpty()) {
-                    put(
-                        "job",
-                        JSONObject().apply {
-                            put("id", jobId)
-                            put("state", jobState)
-                            put("detail", detail)
-                        }
-                    )
-                } else if (jobCopy != null) {
-                    put(
-                        "job",
-                        JSONObject().apply {
-                            put("id", jobCopy.id)
-                            put("state", jobCopy.state)
-                            put("detail", jobCopy.detail)
-                        }
-                    )
-                }
-            }
-
-            val bodyObj = JSONObject().put("state", stateMap)
-            val bodyStr = bodyObj.toString()
-
-            mu.lock()
-            val now = System.currentTimeMillis()
-            if (!force && bodyStr == lastPostedBody && (now - lastPostedTime) < 3000L) {
-                mu.unlock()
-                return
-            }
-            lastPostedBody = bodyStr
-            lastPostedTime = now
-            mu.unlock()
-
-            val reqUrl = cfgSnap.endpoint("/state") + "?agentversion=${AgentConfigStore.AGENT_VERSION}"
-            val request = Request.Builder()
-                .url(reqUrl)
-                .post(bodyStr.toRequestBody(JSON_MEDIA_TYPE))
-                .header("Authorization", "Bearer ${cfgSnap.token}")
-                .header("agentversion", AgentConfigStore.AGENT_VERSION)
-                .build()
-
-            try {
-                httpClient.newCall(request).execute().use { resp ->
-                    val code = resp.code
-                    if (code >= 300) {
-                        val errText = resp.body?.string() ?: ""
-                        logf("postState HTTP $code: ${errText.trim()}")
-                    } else {
-                        val labelLenStr = info.labelLength?.toString() ?: "null"
-                        logf("Posted printer state upstream: HTTP $code (model=\"${info.model}\" serial=\"${info.serial}\" type=\"zpl\" labelLength=$labelLenStr)")
-                    }
-                }
-            } catch (e: Exception) {
-                logf("postState failed: ${e.message}")
-            }
-        } finally {
-            stateMu.unlock()
-        }
     }
 }
