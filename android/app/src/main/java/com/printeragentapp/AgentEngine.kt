@@ -513,12 +513,12 @@ class AgentEngine private constructor(internal val appContext: Context) {
     }
 
     fun scanPrinters(): List<PrinterInfo> {
-        logf("Scanning for ZPL printers (BLE & TCP port 9100)...")
-        val found = PrinterProtocol.scanLocalZPLPrinters()
+        logf("Scanning for printers (Zebra ZPL, Epson ESC/POS & BLE)...")
+        val found = PrinterProtocol.scanLocalPrinters()
         for (p in found) {
             printersInfo[p.ip] = p
         }
-        logf("Scan complete: found ${found.size} ZPL printer(s)")
+        logf("Scan complete: found ${found.size} printer(s)")
         notifyStateChanged()
         return found
     }

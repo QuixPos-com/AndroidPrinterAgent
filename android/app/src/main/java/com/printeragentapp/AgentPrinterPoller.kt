@@ -163,7 +163,7 @@ internal class AgentPrinterPoller(private val engine: AgentEngine) {
                     JSONObject().apply {
                         put("serial", pInfo.serial)
                         put("model", pInfo.model)
-                        put("type", "zpl")
+                        put("type", pInfo.type.ifEmpty { "zpl" })
                         if (pInfo.labelLength != null) {
                             put("labelLength", pInfo.labelLength)
                         } else {
@@ -178,7 +178,7 @@ internal class AgentPrinterPoller(private val engine: AgentEngine) {
                     JSONObject().apply {
                         put("serial", info.serial)
                         put("model", info.model)
-                        put("type", "zpl")
+                        put("type", info.type.ifEmpty { "zpl" })
                         if (info.labelLength != null) {
                             put("labelLength", info.labelLength)
                         } else {

@@ -48,7 +48,8 @@ object PrinterProtocol {
         val model: String,
         val serial: String,
         val labelLength: Int?,
-        val updatedAtMs: Long
+        val updatedAtMs: Long,
+        val type: String = "zpl"
     )
 
     private val cachedMeta = ConcurrentHashMap<String, CachedPrinterMeta>()
@@ -130,7 +131,133 @@ object PrinterProtocol {
         return Pair(trimmed, PRINTER_PORT)
     }
 
-    private fun queryPrinterInfoLocked(ip: String): PrinterInfo {
+    fun parseEscPosChunks(bytes: ByteArray): List<String> {
+        val chunks = ArrayList<String>()
+        var inString = false
+        val sb = StringBuilder()
+        for (b in bytes) {
+            val ub = b.toInt() and 0xFF
+            if (ub == 0x5F && !inString) {
+                inString = true
+                sb.setLength(0)
+            } else if (ub == 0x00 && inString) {
+                inString = false
+                val s = sb.toString().trim()
+                if (s.isNotEmpty()) {
+                    chunks.add(s)
+                }
+            } else if (inString) {
+                if (ub in 0x20..0x7E) {
+                    sb.append(ub.toChar())
+                }
+            }
+        }
+        return chunks
+    }
+
+    fun buildEscPosPrinterInfo(ip: String, chunks: List<String>): PrinterInfo {
+        var maker = ""
+        var model = ""
+        var serial = ""
+
+        when (chunks.size) {
+            1 -> {
+                model = chunks[0]
+            }
+            2 -> {
+                val c0 = chunks[0]
+                val c1 = chunks[1]
+                if (c0.equals("EPSON", ignoreCase = true) || c0.equals("STAR", ignoreCase = true) || c0.equals("CITIZEN", ignoreCase = true)) {
+                    maker = c0
+                    model = c1
+                } else {
+                    model = c0
+                    serial = c1
+                }
+            }
+            else -> {
+                maker = chunks[0]
+                model = chunks[1]
+                serial = chunks[2]
+            }
+        }
+
+        val fullModel = if (maker.isNotEmpty() && !model.contains(maker, ignoreCase = true)) {
+            "$maker $model"
+        } else {
+            model.ifEmpty { maker.ifEmpty { "ESC/POS Printer" } }
+        }
+
+        return PrinterInfo(
+            ip = ip,
+            serial = serial,
+            model = fullModel,
+            type = "escpos",
+            labelLength = null,
+            errors = PrinterErrors(unreachable = false),
+            ready = true,
+            status = "online"
+        )
+    }
+
+    fun queryEscPosPrinter(ip: String, connectTimeoutMs: Int = 1000): PrinterInfo? {
+        val (host, port) = parseHostPort(ip)
+        return try {
+            Socket().use { socket ->
+                socket.tcpNoDelay = true
+                socket.connect(InetSocketAddress(host, port), connectTimeoutMs)
+                socket.soTimeout = 400
+                val out = socket.getOutputStream()
+                val escCmd = byteArrayOf(
+                    0x1D.toByte(), 0x49.toByte(), 66.toByte(),
+                    0x1D.toByte(), 0x49.toByte(), 67.toByte(),
+                    0x1D.toByte(), 0x49.toByte(), 68.toByte()
+                )
+                out.write(escCmd)
+                out.flush()
+
+                val escBytes = ArrayList<Byte>()
+                val buf = ByteArray(1024)
+                val deadline = System.currentTimeMillis() + 500L
+                val input = socket.getInputStream()
+
+                while (System.currentTimeMillis() < deadline) {
+                    val n = try {
+                        input.read(buf)
+                    } catch (_: Exception) {
+                        break
+                    }
+                    if (n > 0) {
+                        for (i in 0 until n) escBytes.add(buf[i])
+                        if (escBytes.count { it == 0x00.toByte() } >= 3) break
+                    } else {
+                        break
+                    }
+                }
+
+                val chunks = parseEscPosChunks(escBytes.toByteArray())
+                if (chunks.isNotEmpty()) {
+                    val info = buildEscPosPrinterInfo(ip, chunks)
+                    cachedMeta[ip] = CachedPrinterMeta(
+                        model = info.model,
+                        serial = info.serial,
+                        labelLength = null,
+                        updatedAtMs = System.currentTimeMillis(),
+                        type = "escpos"
+                    )
+                    info
+                } else {
+                    null
+                }
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun probeEscPosPrinter(ip: String): PrinterInfo? = queryEscPosPrinter(ip, 350)
+
+    private fun queryZplInfo(ip: String, host: String, port: Int, cached: CachedPrinterMeta?): PrinterInfo {
         val offlineInfo = PrinterInfo(
             ip = ip,
             type = "zpl",
@@ -138,14 +265,7 @@ object PrinterProtocol {
             ready = false,
             errors = PrinterErrors(unreachable = true)
         )
-        if (ip.isBlank()) return offlineInfo
-        if (BlePrinterManager.isBluetoothTarget(ip)) {
-            return BlePrinterManager.queryPrinterInfoLocked(ip)
-        }
-
-        val (host, port) = parseHostPort(ip)
         val now = System.currentTimeMillis()
-        val cached = cachedMeta[ip]
         val useFastPoll = cached != null &&
             cached.model.isNotEmpty() &&
             cached.serial.isNotEmpty() &&
@@ -207,7 +327,8 @@ object PrinterProtocol {
                             model = mergedModel,
                             serial = mergedSerial,
                             labelLength = mergedLabelLen,
-                            updatedAtMs = if (useFastPoll) (cached?.updatedAtMs ?: now) else now
+                            updatedAtMs = if (useFastPoll) (cached?.updatedAtMs ?: now) else now,
+                            type = "zpl"
                         )
                     }
                     parsed.copy(
@@ -220,6 +341,47 @@ object PrinterProtocol {
         } catch (_: Exception) {
             offlineInfo
         }
+    }
+
+    private fun queryPrinterInfoLocked(ip: String): PrinterInfo {
+        val offlineInfo = PrinterInfo(
+            ip = ip,
+            type = "zpl",
+            status = "offline",
+            ready = false,
+            errors = PrinterErrors(unreachable = true)
+        )
+        if (ip.isBlank()) return offlineInfo
+        if (BlePrinterManager.isBluetoothTarget(ip)) {
+            return BlePrinterManager.queryPrinterInfoLocked(ip)
+        }
+
+        val (host, port) = parseHostPort(ip)
+        val cached = cachedMeta[ip]
+
+        if (cached?.type == "escpos") {
+            val escInfo = queryEscPosPrinter(ip, 1500)
+            return escInfo ?: offlineInfo.copy(
+                type = "escpos",
+                model = cached.model,
+                serial = cached.serial
+            )
+        }
+
+        val zplInfo = queryZplInfo(ip, host, port, cached)
+        if (!zplInfo.errors.unreachable) {
+            return zplInfo
+        }
+
+        // If ZPL query did not respond and we don't know it's a confirmed ZPL printer, try ESC/POS
+        if (cached == null || cached.type != "zpl" || cached.model.isEmpty()) {
+            val escInfo = queryEscPosPrinter(ip, 1000)
+            if (escInfo != null) {
+                return escInfo
+            }
+        }
+
+        return zplInfo
     }
 
     fun sendZPL(ip: String, zpl: String) {
@@ -692,6 +854,14 @@ object PrinterProtocol {
         return prefixes.toList()
     }
 
+    fun probePrinter(ip: String): PrinterInfo? {
+        val escInfo = queryEscPosPrinter(ip, 350)
+        if (escInfo != null) {
+            return escInfo
+        }
+        return probeZPLPrinter(ip)
+    }
+
     fun probeZPLPrinter(ip: String): PrinterInfo? {
         return try {
             Socket().use { socket ->
@@ -735,6 +905,13 @@ object PrinterProtocol {
                 if (info.model.isEmpty() && info.serial.isEmpty() && !data.contains("ERRORS:") && !data.contains("PRINTER STATUS")) {
                     null
                 } else {
+                    cachedMeta[ip] = CachedPrinterMeta(
+                        model = info.model,
+                        serial = info.serial,
+                        labelLength = info.labelLength,
+                        updatedAtMs = System.currentTimeMillis(),
+                        type = "zpl"
+                    )
                     info
                 }
             }
@@ -743,7 +920,7 @@ object PrinterProtocol {
         }
     }
 
-    fun scanLocalZPLPrinters(): List<PrinterInfo> {
+    fun scanLocalPrinters(): List<PrinterInfo> {
         val bleResults = Collections.synchronizedList(ArrayList<PrinterInfo>())
         val bleThread = Thread({
             try {
@@ -774,7 +951,7 @@ object PrinterProtocol {
                     Callable {
                         sem.acquire()
                         try {
-                            val info = probeZPLPrinter(ip)
+                            val info = probePrinter(ip)
                             if (info != null) {
                                 found.add(info)
                             }
@@ -797,4 +974,6 @@ object PrinterProtocol {
 
         return bleResults + found.sortedBy { it.ip }
     }
+
+    fun scanLocalZPLPrinters(): List<PrinterInfo> = scanLocalPrinters()
 }

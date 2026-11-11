@@ -347,7 +347,7 @@ function PrinterAgentMain(): React.JSX.Element {
       await PrinterAgent.requestBluetoothPermissions();
       const found = await PrinterAgent.scanLocalPrinters();
       if (!Array.isArray(found) || found.length === 0) {
-        showToast('Keine Drucker gefunden (Bluetooth oder TCP 9100)', 'error');
+        showToast('Keine Drucker gefunden (Zebra, Epson oder Bluetooth)', 'error');
         setDiscoveredPrinters([]);
         setShowDiscovered(false);
         return;
@@ -394,21 +394,21 @@ function PrinterAgentMain(): React.JSX.Element {
   const readyCount = printers.filter(p => printerInfoByIp[p.trim()]?.ready).length;
   const overall: { title: string; body: string; tone: Tone } = backendConnected
     ? {
-        title: 'Verbunden',
-        body: `Gekoppelt als „${agentName || 'Agent'}“ · ${readyCount} von ${printers.length} Drucker bereit`,
-        tone: 'success',
-      }
+      title: 'Verbunden',
+      body: `Gekoppelt als „${agentName || 'Agent'}“ · ${readyCount} von ${printers.length} Drucker bereit`,
+      tone: 'success',
+    }
     : isPaired
       ? {
-          title: 'Verbindung wird hergestellt…',
-          body: `Gekoppelt als „${agentName || 'Agent'}“`,
-          tone: 'warning',
-        }
+        title: 'Verbindung wird hergestellt…',
+        body: `Gekoppelt als „${agentName || 'Agent'}“`,
+        tone: 'warning',
+      }
       : {
-          title: 'Nicht gekoppelt',
-          body: 'Kopplungs-PIN aus dem QuixPOS-Dashboard eingeben, um Druckaufträge zu empfangen.',
-          tone: 'neutral',
-        };
+        title: 'Nicht gekoppelt',
+        body: 'Kopplungs-PIN aus dem QuixPOS-Dashboard eingeben, um Druckaufträge zu empfangen.',
+        tone: 'neutral',
+      };
   const overallColors = toneColors(t, overall.tone);
 
   const editTitle =
@@ -522,7 +522,7 @@ function PrinterAgentMain(): React.JSX.Element {
               extraColor={colors.fg}
               leading={
                 <Avatar
-                  label={ble ? 'BT' : 'IP'}
+                  label={ble ? 'BT' : info?.type === 'escpos' ? 'POS' : 'ZPL'}
                   background={colors.container}
                   color={colors.onContainer}
                 />
@@ -533,7 +533,7 @@ function PrinterAgentMain(): React.JSX.Element {
         })}
         <ListItem
           headline={isScanning ? 'Suche läuft…' : 'Nach Druckern suchen'}
-          supporting="Bluetooth und Netzwerk (TCP 9100)"
+          supporting="Bluetooth und Netzwerk (Zebra & Epson)"
           disabled={isScanning}
           leading={
             isScanning ? (
@@ -689,7 +689,7 @@ function PrinterAgentMain(): React.JSX.Element {
               disabled={added || isSaving}
               leading={
                 <Avatar
-                  label={isBleAddress(p.ip) ? 'BT' : 'IP'}
+                  label={isBleAddress(p.ip) ? 'BT' : p.type === 'escpos' ? 'POS' : 'ZPL'}
                   background={t.secondaryContainer}
                   color={t.onSecondaryContainer}
                 />
