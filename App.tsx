@@ -2,13 +2,10 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   BackHandler,
-  Platform,
   ScrollView,
   StatusBar,
   StyleSheet,
   Text,
-  TextInput,
-  TouchableOpacity,
   View,
 } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -18,52 +15,92 @@ import {
   PrinterAgentEvents,
   PrinterInfo,
 } from './src/native/PrinterAgent';
+import {
+  Avatar,
+  Button,
+  Dialog,
+  Divider,
+  ListItem,
+  OverflowMenu,
+  PlusIcon,
+  SearchIcon,
+  SectionHeader,
+  Snackbar,
+  Switch,
+  TextField,
+  TopAppBar,
+} from './src/ui/components';
+import { Tone, toneColors, type, useTheme } from './src/ui/theme';
 
-const getPrinterStatusDisplay = (info?: PrinterInfo) => {
-  if (!info) return { text: 'UNBEKANNT', color: '#94a3b8', errorAlert: null };
+const DEFAULT_API_URL = 'https://dash.quixpos.com';
+const DEFAULT_PORT = '41783';
+
+const isBleAddress = (addr: string) => {
+  const l = addr.trim().toLowerCase();
+  return (
+    l === 'ble' ||
+    l === 'bluetooth' ||
+    l === 'auto' ||
+    l.startsWith('ble:') ||
+    l.startsWith('bt:') ||
+    /^([0-9a-f]{2}[:-]){5}[0-9a-f]{2}$/i.test(l)
+  );
+};
+
+const describeAddress = (addr: string) => {
+  const l = addr.trim().toLowerCase();
+  if (l === 'ble' || l === 'bluetooth' || l === 'auto') return 'Bluetooth (automatisch)';
+  return addr.trim();
+};
+
+const getPrinterStatusDisplay = (
+  info?: PrinterInfo,
+): { text: string; tone: Tone; errorAlert: string | null } => {
+  if (!info) return { text: 'Status unbekannt', tone: 'neutral', errorAlert: null };
   if (info.errors?.headOpen || info.status === 'headOpen') {
     return {
-      text: 'DRUCKERKOPF OFFEN',
-      color: '#ef4444',
-      errorAlert: '⚠️ Druckerkopf ist geöffnet! Bitte Klappe schließen.',
+      text: 'Druckkopf offen',
+      tone: 'error',
+      errorAlert: 'Druckkopf ist geöffnet. Bitte Klappe schließen.',
     };
   }
   if (info.errors?.pause || info.status === 'pause') {
     return {
-      text: 'PAUSIERT',
-      color: '#f59e0b',
-      errorAlert: '⏸️ Drucker ist pausiert! Bitte Pause-Taste am Drucker drücken.',
+      text: 'Pausiert',
+      tone: 'warning',
+      errorAlert: 'Drucker ist pausiert. Bitte Pause-Taste am Drucker drücken.',
     };
   }
   if (info.errors?.unreachable || info.status === 'offline') {
-    return {
-      text: 'NICHT ERREICHBAR',
-      color: '#ef4444',
-      errorAlert: null,
-    };
+    return { text: 'Nicht erreichbar', tone: 'error', errorAlert: null };
   }
   if (info.errors?.other || info.status === 'error') {
     return {
-      text: 'DRUCKERFEHLER',
-      color: '#ef4444',
-      errorAlert: '⚠️ Drucker meldet einen Fehler (Papier/Farbband prüfen).',
+      text: 'Druckerfehler',
+      tone: 'error',
+      errorAlert: 'Drucker meldet einen Fehler (Papier/Farbband prüfen).',
     };
   }
   if (info.ready || info.status === 'online') {
-    return { text: 'BEREIT / ONLINE', color: '#22c55e', errorAlert: null };
+    return { text: 'Bereit', tone: 'success', errorAlert: null };
   }
-  return {
-    text: (info.status || 'UNBEKANNT').toUpperCase(),
-    color: '#f59e0b',
-    errorAlert: null,
-  };
+  return { text: info.status || 'Status unbekannt', tone: 'warning', errorAlert: null };
 };
 
+type EditState =
+  | { kind: 'api'; value: string }
+  | { kind: 'port'; value: string }
+  | { kind: 'printer'; index: number | null; value: string };
+
 function PrinterAgentMain(): React.JSX.Element {
+  const t = useTheme();
   const insets = useSafeAreaInsets();
-  const [apiUrl, setApiUrl] = useState<string>('https://dash.quixpos.com');
-  const [port, setPort] = useState<string>('41783');
-  const [printerRows, setPrinterRows] = useState<string[]>(['']);
+
+  // Persisted configuration
+  const [apiUrl, setApiUrl] = useState<string>(DEFAULT_API_URL);
+  const [port, setPort] = useState<string>(DEFAULT_PORT);
+  const [printers, setPrinters] = useState<string[]>([]);
+
   const [printerInfoByIp, setPrinterInfoByIp] = useState<Record<string, PrinterInfo>>({});
   const [discoveredPrinters, setDiscoveredPrinters] = useState<PrinterInfo[]>([]);
   const [showDiscovered, setShowDiscovered] = useState<boolean>(false);
@@ -74,14 +111,18 @@ function PrinterAgentMain(): React.JSX.Element {
   const [backendConnected, setBackendConnected] = useState<boolean>(false);
   const [pairPin, setPairPin] = useState<string>('');
   const [isPairing, setIsPairing] = useState<boolean>(false);
+  const [confirmUnpair, setConfirmUnpair] = useState<boolean>(false);
 
   const [isRunning, setIsRunning] = useState<boolean>(false);
   const [isForegroundNotif, setIsForegroundNotif] = useState<boolean>(false);
 
-  const [toastMsg, setToastMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(
-    null,
-  );
-  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [edit, setEdit] = useState<EditState | null>(null);
+  const [isSaving, setIsSaving] = useState<boolean>(false);
+  const [menuOpen, setMenuOpen] = useState<boolean>(false);
+  const [scrolled, setScrolled] = useState<boolean>(false);
+
+  const [snackbar, setSnackbar] = useState<string | null>(null);
+  const snackbarTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const handleClose = useCallback(() => {
     try {
@@ -90,14 +131,12 @@ function PrinterAgentMain(): React.JSX.Element {
     BackHandler.exitApp();
   }, []);
 
-  const showToast = useCallback((text: string, type: 'success' | 'error' = 'success') => {
-    if (toastTimerRef.current) {
-      clearTimeout(toastTimerRef.current);
+  const showToast = useCallback((text: string, _type: 'success' | 'error' = 'success') => {
+    if (snackbarTimerRef.current) {
+      clearTimeout(snackbarTimerRef.current);
     }
-    setToastMsg({ text, type });
-    toastTimerRef.current = setTimeout(() => {
-      setToastMsg(null);
-    }, 3500);
+    setSnackbar(text);
+    snackbarTimerRef.current = setTimeout(() => setSnackbar(null), 4000);
   }, []);
 
   const applySnapshot = useCallback((snap: AgentSnapshot | null) => {
@@ -126,15 +165,15 @@ function PrinterAgentMain(): React.JSX.Element {
       await PrinterAgent.startForegroundService();
 
       const cfg = await PrinterAgent.getConfig();
-      setApiUrl(cfg.api_url || 'https://dash.quixpos.com');
-      setPort(cfg.port || '41783');
+      setApiUrl(cfg.api_url || DEFAULT_API_URL);
+      setPort(cfg.port || DEFAULT_PORT);
       const initialPrinters =
         cfg.zpl_printers && cfg.zpl_printers.length > 0
           ? cfg.zpl_printers
           : cfg.printer_ip
             ? [cfg.printer_ip]
-            : [''];
-      setPrinterRows(initialPrinters);
+            : [];
+      setPrinters(initialPrinters.map(p => p.trim()).filter(Boolean));
 
       const svc = await PrinterAgent.getServiceStatus();
       setIsRunning(svc.running);
@@ -176,34 +215,97 @@ function PrinterAgentMain(): React.JSX.Element {
     };
   }, [applySnapshot, loadInitialState]);
 
-  const handleSaveConfig = async () => {
-    const cleanApi = apiUrl.trim();
-    if (!cleanApi) {
+  /** Saves the configuration (with the given changes applied) and reconnects printers. */
+  const persistConfig = async (
+    patch: { apiUrl?: string; printers?: string[]; port?: string },
+    successMsg: string,
+  ): Promise<boolean> => {
+    const nextApi = (patch.apiUrl ?? apiUrl).trim();
+    const nextPrinters = (patch.printers ?? printers).map(r => r.trim()).filter(Boolean);
+    const nextPort = (patch.port ?? port).trim() || DEFAULT_PORT;
+    if (!nextApi) {
       showToast('QuixPOS-API-URL ist erforderlich', 'error');
-      return;
+      return false;
     }
-    const cleanPrinters = printerRows.map(r => r.trim()).filter(Boolean);
-    const hasBle = cleanPrinters.some(p => {
-      const l = p.toLowerCase();
-      return (
-        l === 'ble' ||
-        l === 'bluetooth' ||
-        l === 'auto' ||
-        l.startsWith('ble:') ||
-        l.startsWith('bt:') ||
-        /^([0-9a-f]{2}[:-]){5}[0-9a-f]{2}$/i.test(l)
-      );
-    });
+    setIsSaving(true);
     try {
-      if (hasBle) {
+      if (nextPrinters.some(isBleAddress)) {
         await PrinterAgent.requestBluetoothPermissions();
       }
-      const snap = await PrinterAgent.saveConfig(cleanApi, cleanPrinters, port.trim() || '41783');
+      const snap = await PrinterAgent.saveConfig(nextApi, nextPrinters, nextPort);
+      setApiUrl(nextApi);
+      setPrinters(nextPrinters);
+      setPort(nextPort);
       applySnapshot(snap);
-      showToast('Konfiguration gespeichert & Drucker neu verbunden!');
+      showToast(successMsg);
+      return true;
     } catch (e: any) {
       showToast(`Fehler beim Speichern: ${e?.message || String(e)}`, 'error');
+      return false;
+    } finally {
+      setIsSaving(false);
     }
+  };
+
+  const addPrinter = async (info: PrinterInfo) => {
+    const ip = info.ip.trim();
+    setPrinterInfoByIp(prev => ({ ...prev, [ip]: info }));
+    if (printers.some(r => r.trim() === ip)) {
+      showToast(`${ip} ist bereits eingerichtet`);
+      return;
+    }
+    await persistConfig(
+      { printers: [...printers, ip] },
+      `${info.model || 'Drucker'} hinzugefügt`,
+    );
+  };
+
+  const handleSaveEdit = async () => {
+    if (!edit) return;
+    const value = edit.value.trim();
+
+    if (edit.kind === 'api') {
+      if (!value) {
+        showToast('QuixPOS-API-URL ist erforderlich', 'error');
+        return;
+      }
+      if (await persistConfig({ apiUrl: value }, 'API-URL gespeichert')) setEdit(null);
+      return;
+    }
+
+    if (edit.kind === 'port') {
+      const n = Number(value);
+      if (!Number.isInteger(n) || n < 1 || n > 65535) {
+        showToast('Ungültiger Port (1–65535)', 'error');
+        return;
+      }
+      if (await persistConfig({ port: String(n) }, 'Port gespeichert')) setEdit(null);
+      return;
+    }
+
+    if (!value) {
+      showToast('Bitte eine Druckeradresse eingeben', 'error');
+      return;
+    }
+    const duplicate = printers.some(
+      (p, i) => i !== edit.index && p.trim().toLowerCase() === value.toLowerCase(),
+    );
+    if (duplicate) {
+      showToast('Dieser Drucker ist bereits eingerichtet', 'error');
+      return;
+    }
+    const next =
+      edit.index === null
+        ? [...printers, value]
+        : printers.map((p, i) => (i === edit.index ? value : p));
+    if (await persistConfig({ printers: next }, 'Drucker gespeichert & neu verbunden')) {
+      setEdit(null);
+    }
+  };
+
+  const handleRemovePrinter = async (index: number) => {
+    const next = printers.filter((_, i) => i !== index);
+    if (await persistConfig({ printers: next }, 'Drucker entfernt')) setEdit(null);
   };
 
   const handlePair = async () => {
@@ -218,7 +320,7 @@ function PrinterAgentMain(): React.JSX.Element {
       setPairPin('');
       setIsPaired(true);
       setAgentName(res.name || 'android-agent');
-      showToast(`Erfolgreich gekoppelt als „${res.name || 'Agent'}“!`);
+      showToast(`Gekoppelt als „${res.name || 'Agent'}“`);
     } catch (e: any) {
       showToast(`Kopplung fehlgeschlagen: ${e?.message || String(e)}`, 'error');
     } finally {
@@ -227,12 +329,13 @@ function PrinterAgentMain(): React.JSX.Element {
   };
 
   const handleUnpair = async () => {
+    setConfirmUnpair(false);
     try {
       await PrinterAgent.unpairAgent();
       setIsPaired(false);
       setAgentName('');
       setBackendConnected(false);
-      showToast('Agent getrennt (Token gelöscht & Verbindung beendet)');
+      showToast('Agent getrennt');
     } catch (e: any) {
       showToast(`Fehler beim Entkoppeln: ${e?.message || String(e)}`, 'error');
     }
@@ -244,7 +347,7 @@ function PrinterAgentMain(): React.JSX.Element {
       await PrinterAgent.requestBluetoothPermissions();
       const found = await PrinterAgent.scanLocalPrinters();
       if (!Array.isArray(found) || found.length === 0) {
-        showToast('Keine Drucker gefunden (BLE oder TCP 9100)', 'error');
+        showToast('Keine Drucker gefunden (Bluetooth oder TCP 9100)', 'error');
         setDiscoveredPrinters([]);
         setShowDiscovered(false);
         return;
@@ -258,74 +361,13 @@ function PrinterAgentMain(): React.JSX.Element {
         return next;
       });
 
-      if (found.length === 1) {
-        selectDiscoveredPrinter(found[0]);
-        showToast(`${found[0].model || 'Drucker'} unter ${found[0].ip} gefunden`);
-        setShowDiscovered(false);
-      } else {
-        setDiscoveredPrinters(found);
-        setShowDiscovered(true);
-        showToast(`${found.length} Drucker gefunden (BLE / TCP)`);
-      }
+      setDiscoveredPrinters(found);
+      setShowDiscovered(true);
     } catch (e: any) {
       showToast(`Suchlauf fehlgeschlagen: ${e?.message || String(e)}`, 'error');
     } finally {
       setIsScanning(false);
     }
-  };
-
-  const selectDiscoveredPrinter = (info: PrinterInfo) => {
-    const ip = info.ip.trim();
-    setPrinterInfoByIp(prev => ({ ...prev, [ip]: info }));
-    setPrinterRows(prev => {
-      if (prev.some(r => r.trim() === ip)) {
-        return prev;
-      }
-      const emptyIdx = prev.findIndex(r => r.trim() === '');
-      if (emptyIdx !== -1) {
-        const copy = [...prev];
-        copy[emptyIdx] = ip;
-        return copy;
-      }
-      return [...prev, ip];
-    });
-  };
-
-  const handleAddPrinterRow = () => {
-    setPrinterRows(prev => [...prev, '']);
-  };
-
-  const handleAddBleAutoRow = async () => {
-    try {
-      await PrinterAgent.requestBluetoothPermissions();
-    } catch { }
-    setPrinterRows(prev => {
-      if (prev.some(r => r.trim().toLowerCase() === 'ble')) {
-        return prev;
-      }
-      const emptyIdx = prev.findIndex(r => r.trim() === '');
-      if (emptyIdx !== -1) {
-        const copy = [...prev];
-        copy[emptyIdx] = 'ble';
-        return copy;
-      }
-      return [...prev, 'ble'];
-    });
-  };
-
-  const handleUpdatePrinterRow = (index: number, value: string) => {
-    setPrinterRows(prev => {
-      const copy = [...prev];
-      copy[index] = value;
-      return copy;
-    });
-  };
-
-  const handleRemovePrinterRow = (index: number) => {
-    setPrinterRows(prev => {
-      const next = prev.filter((_, idx) => idx !== index);
-      return next.length > 0 ? next : [''];
-    });
   };
 
   const handleToggleForegroundService = async () => {
@@ -334,343 +376,349 @@ function PrinterAgentMain(): React.JSX.Element {
         await PrinterAgent.stopForegroundService();
         setIsForegroundNotif(false);
         setIsRunning(false);
-        showToast('Hintergrund-Statusleistendienst gestoppt');
+        showToast('Hintergrunddienst gestoppt');
       } else {
         await PrinterAgent.requestNotificationPermission();
         await PrinterAgent.startForegroundService();
         setIsForegroundNotif(true);
         setIsRunning(true);
-        showToast('Hintergrund-Statusleistendienst gestartet');
+        showToast('Hintergrunddienst gestartet');
       }
     } catch (e: any) {
       showToast(`Dienstfehler: ${e?.message || String(e)}`, 'error');
     }
   };
 
+  /* ---------------------------------------------------------------- */
+
+  const readyCount = printers.filter(p => printerInfoByIp[p.trim()]?.ready).length;
+  const overall: { title: string; body: string; tone: Tone } = backendConnected
+    ? {
+        title: 'Verbunden',
+        body: `Gekoppelt als „${agentName || 'Agent'}“ · ${readyCount} von ${printers.length} Drucker bereit`,
+        tone: 'success',
+      }
+    : isPaired
+      ? {
+          title: 'Verbindung wird hergestellt…',
+          body: `Gekoppelt als „${agentName || 'Agent'}“`,
+          tone: 'warning',
+        }
+      : {
+          title: 'Nicht gekoppelt',
+          body: 'Kopplungs-PIN aus dem QuixPOS-Dashboard eingeben, um Druckaufträge zu empfangen.',
+          tone: 'neutral',
+        };
+  const overallColors = toneColors(t, overall.tone);
+
+  const editTitle =
+    edit?.kind === 'api'
+      ? 'QuixPOS-API-URL'
+      : edit?.kind === 'port'
+        ? 'Lokaler Service-Port'
+        : edit?.index === null
+          ? 'Drucker hinzufügen'
+          : 'Drucker bearbeiten';
+
   return (
-    <View
-      style={[
-        styles.safeArea,
-        {
-          paddingTop: insets.top,
-          paddingBottom: insets.bottom,
+    <View style={[styles.root, { backgroundColor: t.surface }]}>
+      <StatusBar barStyle={t.dark ? 'light-content' : 'dark-content'} />
+
+      <TopAppBar
+        title="QuixPOS Printer Agent"
+        topInset={insets.top}
+        scrolled={scrolled}
+        onMenuPress={() => setMenuOpen(true)}
+      />
+
+      <ScrollView
+        style={styles.flex}
+        contentContainerStyle={{
+          paddingBottom: insets.bottom + 24,
           paddingLeft: insets.left,
           paddingRight: insets.right,
-        },
-      ]}>
-      <StatusBar barStyle="light-content" />
-
-      {/* Top Header */}
-      <View style={styles.header}>
-        <View style={styles.headerBrand}>
-          <View style={styles.headerIcon}>
-            <Text style={styles.headerIconText}>QP</Text>
+        }}
+        keyboardShouldPersistTaps="handled"
+        scrollEventThrottle={16}
+        onScroll={e => setScrolled(e.nativeEvent.contentOffset.y > 0)}>
+        {/* Status card */}
+        <View style={[styles.statusCard, { backgroundColor: overallColors.container }]}>
+          <View style={[styles.statusIndicator, { borderColor: overallColors.onContainer }]}>
+            <View style={[styles.statusIndicatorDot, { backgroundColor: overallColors.onContainer }]} />
           </View>
-          <View>
-            <Text style={styles.headerTitle}>QuixPosPrinterAgent</Text>
-          </View>
-        </View>
-        <View style={styles.headerRight}>
-          <View
-            style={[
-              styles.statusPill,
-              backendConnected
-                ? styles.pillOnline
-                : isPaired
-                  ? styles.pillWarning
-                  : styles.pillOffline,
-            ]}>
-            <View
-              style={[
-                styles.statusDot,
-                backendConnected
-                  ? styles.dotOnline
-                  : isPaired
-                    ? styles.dotWarning
-                    : styles.dotOffline,
-              ]}
-            />
-            <Text
-              style={[
-                styles.statusPillText,
-                backendConnected
-                  ? styles.textOnline
-                  : isPaired
-                    ? styles.textWarning
-                    : styles.textOffline,
-              ]}>
-              {backendConnected ? 'ONLINE' : isPaired ? 'VERBINDUNG...' : 'NICHT GEKOPPELT'}
+          <View style={styles.flex}>
+            <Text style={[type.titleMedium, { color: overallColors.onContainer }]}>
+              {overall.title}
+            </Text>
+            <Text style={[type.bodyMedium, { color: overallColors.onContainer }]}>
+              {overall.body}
             </Text>
           </View>
-          <TouchableOpacity
-            style={styles.headerCloseBtn}
-            onPress={handleClose}
-            accessibilityLabel="Schließen"
-            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
-            <Text style={styles.headerCloseBtnText}>✕</Text>
-          </TouchableOpacity>
         </View>
-      </View>
 
-      <ScrollView style={styles.scrollArea} contentContainerStyle={styles.scrollContent}>
-        {/* Card 1: Connection Settings (API URL & Local Port) */}
-        <View style={styles.card}>
-          <Text style={styles.cardTitle}>VERBINDUNGSEINSTELLUNGEN</Text>
-          <View style={styles.formGroup}>
-            <Text style={styles.label}>QUIXPOS API-URL</Text>
-            <TextInput
-              style={styles.input}
-              value={apiUrl}
-              onChangeText={setApiUrl}
-              placeholder="https://dash.quixpos.com"
-              placeholderTextColor="#64748b"
-              autoCapitalize="none"
+        {/* Pairing */}
+        <SectionHeader title="Kopplung" />
+        {isPaired ? (
+          <ListItem
+            headline={agentName || 'Agent'}
+            supporting={backendConnected ? 'Mit QuixPOS verbunden' : 'Verbindung wird hergestellt…'}
+            trailing={
+              <Button
+                variant="text"
+                destructive
+                label="Trennen"
+                onPress={() => setConfirmUnpair(true)}
+              />
+            }
+          />
+        ) : (
+          <View style={styles.pairRow}>
+            <TextField
+              style={styles.flex}
+              label="Kopplungs-PIN"
+              containerColor={t.surface}
+              value={pairPin}
+              onChangeText={setPairPin}
+              placeholder="6-stellig"
+              autoCapitalize="characters"
               autoCorrect={false}
+              maxLength={12}
+              onSubmitEditing={handlePair}
+              returnKeyType="done"
             />
+            <Button label="Koppeln" onPress={handlePair} loading={isPairing} />
           </View>
-          <View style={styles.formGroup}>
-            <Text style={styles.label}>LOKALER SERVICE-PORT</Text>
-            <TextInput
-              style={styles.input}
-              value={port}
-              onChangeText={setPort}
-              placeholder="41783"
-              placeholderTextColor="#64748b"
-              keyboardType="numeric"
-            />
-          </View>
-          <TouchableOpacity style={styles.btnPrimary} onPress={handleSaveConfig}>
-            <Text style={styles.btnPrimaryText}>💾 Verbindungseinstellungen speichern</Text>
-          </TouchableOpacity>
-        </View>
+        )}
 
-        {/* Card 2: ZPL Printers (Add IPs / BLE, Scan TCP 9100 & BLE, Live Status) */}
-        <View style={styles.card}>
-          <View style={styles.cardHeaderRow}>
-            <Text style={styles.cardTitle}>DRUCKER (TCP & BLE)</Text>
-            <View style={styles.rowActions}>
-              <TouchableOpacity
-                style={[styles.btnSecondarySm, isScanning && styles.btnDisabled]}
-                onPress={handleScanPrinters}
-                disabled={isScanning}>
-                {isScanning ? (
-                  <View style={styles.scanningRow}>
-                    <ActivityIndicator size="small" color="#38bdf8" />
-                    <Text style={styles.btnSecondaryText}> Sucht...</Text>
-                  </View>
-                ) : (
-                  <Text style={styles.btnSecondaryText}>🔍 Suchen</Text>
-                )}
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.btnOutlineSm} onPress={handleAddBleAutoRow}>
-                <Text style={styles.btnOutlineText}>+ BLE</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.btnOutlineSm} onPress={handleAddPrinterRow}>
-                <Text style={styles.btnOutlineText}>+ Hinzufügen</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
+        <Divider />
 
-          {/* Discovered Printers Box */}
-          {showDiscovered && discoveredPrinters.length > 0 && (
-            <View style={styles.discoveredBox}>
-              <View style={styles.discoveredHeader}>
-                <Text style={styles.discoveredHeaderText}>
-                  Gefunden ({discoveredPrinters.length}): Zum Hinzufügen tippen
-                </Text>
-                <TouchableOpacity onPress={() => setShowDiscovered(false)}>
-                  <Text style={styles.closeBtnText}>✕</Text>
-                </TouchableOpacity>
-              </View>
-              {discoveredPrinters.map(p => (
-                <TouchableOpacity
-                  key={p.ip}
-                  style={styles.discoveredItem}
-                  onPress={() => {
-                    selectDiscoveredPrinter(p);
-                    showToast(`${p.ip} (${p.model || 'Drucker'}) hinzugefügt`);
-                  }}>
-                  <View style={styles.discoveredItemTop}>
-                    <Text style={styles.discoveredIp}>{p.ip}</Text>
-                    <Text style={styles.discoveredModel}>{p.model || 'Drucker'}</Text>
-                  </View>
-                  {!!p.serial && <Text style={styles.discoveredSerial}>SN: {p.serial}</Text>}
-                </TouchableOpacity>
-              ))}
-            </View>
-          )}
-
-          {/* Printer IP Inputs */}
-          {printerRows.map((ipVal, idx) => {
-            const cleanIp = ipVal.trim();
-            const info = cleanIp ? printerInfoByIp[cleanIp] : undefined;
-            const statusDisplay = getPrinterStatusDisplay(info);
-
-            return (
-              <View key={`printer-row-${idx}`} style={styles.printerItemContainer}>
-                <View style={styles.printerInputRow}>
-                  <TextInput
-                    style={[styles.input, styles.printerInput]}
-                    value={ipVal}
-                    onChangeText={val => handleUpdatePrinterRow(idx, val)}
-                    placeholder="z. B. 192.168.1.100 oder ble oder ble:34:14:B5:..."
-                    placeholderTextColor="#64748b"
-                    autoCapitalize="none"
-                    autoCorrect={false}
-                  />
-                  <TouchableOpacity
-                    style={styles.btnRemovePrinter}
-                    onPress={() => handleRemovePrinterRow(idx)}>
-                    <Text style={styles.btnRemovePrinterText}>✕</Text>
-                  </TouchableOpacity>
-                </View>
-
-                {info && (info.model || info.serial || info.status || info.labelLength != null) && (
-                  <View style={styles.printerMetaBox}>
-                    <View style={[styles.printerDot, { backgroundColor: statusDisplay.color }]} />
-                    <View style={styles.printerMetaTextCol}>
-                      <Text style={styles.printerMetaLine}>
-                        <Text style={styles.metaDim}>Status: </Text>
-                        <Text style={[styles.metaValue, { color: statusDisplay.color }]}>
-                          {statusDisplay.text}
-                        </Text>
-                        {info.labelLength != null && (
-                          <Text style={styles.metaDim}> • Länge: {info.labelLength} Dots</Text>
-                        )}
-                      </Text>
-                      <Text style={styles.printerMetaLine}>
-                        <Text style={styles.metaDim}>Modell: </Text>
-                        <Text style={styles.metaValue}>{info.model || '-'}</Text>
-                        <Text style={styles.metaDim}> | Seriennr.: </Text>
-                        <Text style={styles.metaAccent}>{info.serial || '-'}</Text>
-                      </Text>
-                      {statusDisplay.errorAlert && (
-                        <Text style={styles.printerAlertText}>
-                          {statusDisplay.errorAlert}
-                        </Text>
-                      )}
-                    </View>
-                  </View>
-                )}
-              </View>
-            );
-          })}
-
-          <TouchableOpacity style={styles.btnPrimary} onPress={handleSaveConfig}>
-            <Text style={styles.btnPrimaryText}>💾 Drucker speichern</Text>
-          </TouchableOpacity>
-        </View>
-
-        {/* Card 3: Pairing & Background Notification Service */}
-        <View style={styles.splitRow}>
-          {/* Pairing Card */}
-          <View style={[styles.card, styles.halfCard]}>
-            <Text style={styles.cardTitle}>KOPPLUNG</Text>
-            <View style={styles.statusRowBox}>
-              <Text style={styles.statusRowLabel}>Gekoppelt:</Text>
-              <View
-                style={[
-                  styles.statusPillSm,
-                  isPaired ? styles.pillOnline : styles.pillOffline,
-                ]}>
-                <Text
-                  style={[
-                    styles.statusPillTextSm,
-                    isPaired ? styles.textOnline : styles.textOffline,
-                  ]}
-                  numberOfLines={1}>
-                  {isPaired ? `JA (${agentName || 'Agent'})` : 'NEIN'}
-                </Text>
-              </View>
-            </View>
-
-            {!isPaired ? (
-              <View style={styles.pairInputRow}>
-                <TextInput
-                  style={[styles.input, styles.pinInput]}
-                  value={pairPin}
-                  onChangeText={setPairPin}
-                  placeholder="6-stellige PIN"
-                  placeholderTextColor="#64748b"
-                  autoCapitalize="characters"
+        {/* Printers */}
+        <SectionHeader title="Drucker" />
+        {printers.length === 0 && (
+          <ListItem
+            headline="Keine Drucker eingerichtet"
+            supporting="Suche nach Druckern im Netzwerk und per Bluetooth oder füge einen manuell hinzu."
+          />
+        )}
+        {printers.map((addr, idx) => {
+          const info = printerInfoByIp[addr.trim()];
+          const status = getPrinterStatusDisplay(info);
+          const colors = toneColors(t, status.tone);
+          const ble = isBleAddress(addr);
+          const details = [describeAddress(addr), info?.serial ? `SN ${info.serial}` : null]
+            .filter(Boolean)
+            .join(' · ');
+          return (
+            <ListItem
+              key={`${addr}-${idx}`}
+              headline={info?.model || describeAddress(addr)}
+              supporting={info?.model ? details : status.text}
+              supportingColor={info?.model ? undefined : colors.fg}
+              extra={
+                info?.model
+                  ? status.errorAlert || status.text
+                  : status.errorAlert
+              }
+              extraColor={colors.fg}
+              leading={
+                <Avatar
+                  label={ble ? 'BT' : 'IP'}
+                  background={colors.container}
+                  color={colors.onContainer}
                 />
-                <TouchableOpacity
-                  style={[styles.btnPair, isPairing && styles.btnDisabled]}
-                  onPress={handlePair}
-                  disabled={isPairing}>
-                  <Text style={styles.btnPrimaryText}>{isPairing ? '...' : 'Koppeln'}</Text>
-                </TouchableOpacity>
-              </View>
+              }
+              onPress={() => setEdit({ kind: 'printer', index: idx, value: addr })}
+            />
+          );
+        })}
+        <ListItem
+          headline={isScanning ? 'Suche läuft…' : 'Nach Druckern suchen'}
+          supporting="Bluetooth und Netzwerk (TCP 9100)"
+          disabled={isScanning}
+          leading={
+            isScanning ? (
+              <ActivityIndicator color={t.primary} />
             ) : (
-              <TouchableOpacity style={styles.btnDanger} onPress={handleUnpair}>
-                <Text style={styles.btnDangerText}>Agent trennen</Text>
-              </TouchableOpacity>
-            )}
-          </View>
+              <SearchIcon color={t.onSurfaceVariant} />
+            )
+          }
+          onPress={handleScanPrinters}
+        />
+        <ListItem
+          headline="Drucker manuell hinzufügen"
+          leading={<PlusIcon color={t.onSurfaceVariant} />}
+          onPress={() => setEdit({ kind: 'printer', index: null, value: '' })}
+        />
 
-          {/* Foreground Notification Bar Service Card */}
-          <View style={[styles.card, styles.halfCard]}>
-            <Text style={styles.cardTitle}>HINTERGRUNDDIENST</Text>
-            <View style={styles.statusRowBox}>
-              <Text style={styles.statusRowLabel}>Aktiv:</Text>
-              <View
-                style={[
-                  styles.statusPillSm,
-                  isRunning ? styles.pillOnline : styles.pillOffline,
-                ]}>
-                <Text
-                  style={[
-                    styles.statusPillTextSm,
-                    isRunning ? styles.textOnline : styles.textOffline,
-                  ]}>
-                  {isRunning ? 'JA' : 'NEIN'}
-                </Text>
-              </View>
-            </View>
-            <View style={styles.statusRowBox}>
-              <Text style={styles.statusRowLabel}>Statusleiste:</Text>
-              <View
-                style={[
-                  styles.statusPillSm,
-                  isForegroundNotif ? styles.pillOnline : styles.pillOffline,
-                ]}>
-                <Text
-                  style={[
-                    styles.statusPillTextSm,
-                    isForegroundNotif ? styles.textOnline : styles.textOffline,
-                  ]}>
-                  {isForegroundNotif ? 'AKTIV' : 'AUS'}
-                </Text>
-              </View>
-            </View>
+        <Divider />
 
-            <TouchableOpacity
-              style={isForegroundNotif ? styles.btnDanger : styles.btnPrimary}
-              onPress={handleToggleForegroundService}>
-              <Text style={isForegroundNotif ? styles.btnDangerText : styles.btnPrimaryText}>
-                {isForegroundNotif ? 'Dienst stoppen' : 'Dienst starten'}
-              </Text>
-            </TouchableOpacity>
-          </View>
-        </View>
+        {/* Background service */}
+        <SectionHeader title="Hintergrunddienst" />
+        <ListItem
+          headline="In Statusleiste ausführen"
+          supporting={
+            isForegroundNotif
+              ? 'Aktiv – Druckaufträge werden auch im Hintergrund empfangen'
+              : isRunning
+                ? 'Agent läuft, aber ohne Benachrichtigung'
+                : 'Gestoppt'
+          }
+          trailing={
+            <Switch value={isForegroundNotif} onValueChange={handleToggleForegroundService} />
+          }
+          onPress={handleToggleForegroundService}
+        />
 
-        {/* Close App Button */}
-        <TouchableOpacity style={styles.btnCloseApp} onPress={handleClose}>
-          <Text style={styles.btnCloseAppText}>Schließen</Text>
-        </TouchableOpacity>
+        <Divider />
+
+        {/* Connection */}
+        <SectionHeader title="Verbindung" />
+        <ListItem
+          headline="QuixPOS-API-URL"
+          supporting={apiUrl}
+          onPress={() => setEdit({ kind: 'api', value: apiUrl })}
+        />
+        <ListItem
+          headline="Lokaler Service-Port"
+          supporting={port}
+          onPress={() => setEdit({ kind: 'port', value: port })}
+        />
       </ScrollView>
 
-      {/* Toast Banner */}
-      {toastMsg && (
-        <View
-          style={[
-            styles.toast,
-            { bottom: Math.max(insets.bottom, 14) + 8 },
-            toastMsg.type === 'error' ? styles.toastError : styles.toastSuccess,
-          ]}>
-          <Text style={styles.toastText}>{toastMsg.text}</Text>
-        </View>
-      )}
+      <Snackbar message={snackbar} bottom={insets.bottom + 12} />
+
+      <OverflowMenu
+        visible={menuOpen}
+        top={insets.top + 8}
+        onDismiss={() => setMenuOpen(false)}
+        items={[
+          { label: 'Nach Druckern suchen', onPress: handleScanPrinters },
+          { label: 'Beenden', onPress: handleClose },
+        ]}
+      />
+
+      {/* Edit dialog (API URL / port / printer) */}
+      <Dialog
+        visible={!!edit}
+        title={editTitle}
+        onDismiss={() => !isSaving && setEdit(null)}
+        actions={
+          <>
+            {edit?.kind === 'printer' && edit.index !== null && (
+              <Button
+                variant="text"
+                destructive
+                label="Entfernen"
+                disabled={isSaving}
+                style={styles.dialogLeadingAction}
+                onPress={() => edit.index !== null && handleRemovePrinter(edit.index)}
+              />
+            )}
+            <Button
+              variant="text"
+              label="Abbrechen"
+              disabled={isSaving}
+              onPress={() => setEdit(null)}
+            />
+            <Button variant="text" label="Speichern" loading={isSaving} onPress={handleSaveEdit} />
+          </>
+        }>
+        {edit && (
+          <>
+            <TextField
+              label={
+                edit.kind === 'api' ? 'URL' : edit.kind === 'port' ? 'Port' : 'Adresse'
+              }
+              containerColor={t.surfaceContainerHigh}
+              value={edit.value}
+              onChangeText={value => setEdit({ ...edit, value })}
+              autoFocus
+              autoCapitalize="none"
+              autoCorrect={false}
+              keyboardType={
+                edit.kind === 'port' ? 'number-pad' : edit.kind === 'api' ? 'url' : 'default'
+              }
+              placeholder={
+                edit.kind === 'api'
+                  ? DEFAULT_API_URL
+                  : edit.kind === 'port'
+                    ? DEFAULT_PORT
+                    : 'z. B. 192.168.1.100'
+              }
+              helper={
+                edit.kind === 'printer'
+                  ? 'IP-Adresse, „ble“ für automatische Bluetooth-Suche oder ble:<MAC-Adresse>'
+                  : edit.kind === 'port'
+                    ? 'Port des lokalen Monitor-Servers auf diesem Gerät'
+                    : undefined
+              }
+              onSubmitEditing={handleSaveEdit}
+            />
+            {edit.kind === 'printer' && (
+              <View style={styles.chipRow}>
+                <Button
+                  variant="outlined"
+                  label="Bluetooth automatisch"
+                  onPress={() => setEdit({ ...edit, value: 'ble' })}
+                />
+              </View>
+            )}
+          </>
+        )}
+      </Dialog>
+
+      {/* Scan results */}
+      <Dialog
+        visible={showDiscovered}
+        title={`${discoveredPrinters.length} Drucker gefunden`}
+        onDismiss={() => setShowDiscovered(false)}
+        scrollable
+        actions={
+          <Button variant="text" label="Schließen" onPress={() => setShowDiscovered(false)} />
+        }>
+        {discoveredPrinters.map(p => {
+          const added = printers.some(r => r.trim() === p.ip.trim());
+          return (
+            <ListItem
+              key={p.ip}
+              headline={p.model || 'Drucker'}
+              supporting={[p.ip, p.serial ? `SN ${p.serial}` : null]
+                .filter(Boolean)
+                .join(' · ')}
+              extra={added ? 'Bereits eingerichtet' : null}
+              disabled={added || isSaving}
+              leading={
+                <Avatar
+                  label={isBleAddress(p.ip) ? 'BT' : 'IP'}
+                  background={t.secondaryContainer}
+                  color={t.onSecondaryContainer}
+                />
+              }
+              onPress={async () => {
+                setShowDiscovered(false);
+                await addPrinter(p);
+              }}
+            />
+          );
+        })}
+      </Dialog>
+
+      {/* Unpair confirmation */}
+      <Dialog
+        visible={confirmUnpair}
+        title="Agent trennen?"
+        onDismiss={() => setConfirmUnpair(false)}
+        actions={
+          <>
+            <Button variant="text" label="Abbrechen" onPress={() => setConfirmUnpair(false)} />
+            <Button variant="text" destructive label="Trennen" onPress={handleUnpair} />
+          </>
+        }>
+        <Text style={[type.bodyMedium, { color: t.onSurfaceVariant }]}>
+          Das Zugangstoken wird gelöscht und die Verbindung zu QuixPOS beendet. Zum erneuten
+          Koppeln wird eine neue PIN benötigt.
+        </Text>
+      </Dialog>
     </View>
   );
 }
@@ -683,406 +731,48 @@ export default function App(): React.JSX.Element {
   );
 }
 
-const monoFont = Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' });
-
 const styles = StyleSheet.create({
-  safeArea: {
-    flex: 1,
-    backgroundColor: '#0f172a',
-  },
-  header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    backgroundColor: '#0f172a',
-  },
-  headerBrand: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
+  root: {
     flex: 1,
   },
-  headerIcon: {
-    width: 32,
-    height: 32,
-    borderRadius: 8,
-    backgroundColor: '#0284c7',
+  flex: {
+    flex: 1,
+  },
+  statusCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginHorizontal: 16,
+    marginTop: 8,
+    padding: 16,
+    borderRadius: 12,
+    gap: 16,
+  },
+  statusIndicator: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    borderWidth: 2,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  headerIconText: {
-    color: '#ffffff',
-    fontWeight: '800',
-    fontSize: 14,
+  statusIndicatorDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
   },
-  headerTitle: {
-    color: '#f8fafc',
-    fontSize: 15,
-    fontWeight: '700',
-  },
-  headerSubtitle: {
-    color: '#94a3b8',
-    fontSize: 11,
-    marginTop: 1,
-  },
-  statusPill: {
+  pairRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    borderRadius: 14,
-    gap: 5,
+    gap: 12,
+    paddingHorizontal: 16,
+    paddingTop: 8,
+    paddingBottom: 8,
   },
-  statusPillSm: {
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 10,
-    maxWidth: 130,
-  },
-  pillOnline: {
-    backgroundColor: 'rgba(34, 197, 94, 0.15)',
-  },
-  pillWarning: {
-    backgroundColor: 'rgba(245, 158, 11, 0.15)',
-  },
-  pillOffline: {
-    backgroundColor: 'rgba(239, 68, 68, 0.15)',
-  },
-  statusDot: {
-    width: 6,
-    height: 6,
-    borderRadius: 3,
-  },
-  dotOnline: {
-    backgroundColor: '#22c55e',
-  },
-  dotWarning: {
-    backgroundColor: '#f59e0b',
-  },
-  dotOffline: {
-    backgroundColor: '#ef4444',
-  },
-  statusPillText: {
-    fontSize: 11,
-    fontWeight: '700',
-  },
-  statusPillTextSm: {
-    fontSize: 10,
-    fontWeight: '700',
-  },
-  textOnline: {
-    color: '#86efac',
-  },
-  textWarning: {
-    color: '#fde047',
-  },
-  textOffline: {
-    color: '#fca5a5',
-  },
-  scrollArea: {
-    flex: 1,
-  },
-  scrollContent: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    gap: 8,
-    paddingBottom: 20,
-  },
-  card: {
-    paddingVertical: 2,
-    gap: 6,
-  },
-  cardHeaderRow: {
+  chipRow: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
+    marginTop: 16,
   },
-  cardTitle: {
-    color: '#94a3b8',
-    fontSize: 11,
-    fontWeight: '700',
-    letterSpacing: 0.5,
-  },
-  rowActions: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  formGroup: {
-    gap: 2,
-  },
-  label: {
-    color: '#94a3b8',
-    fontSize: 10,
-    fontWeight: '600',
-    letterSpacing: 0.3,
-  },
-  input: {
-    backgroundColor: '#1e293b',
-    borderRadius: 8,
-    color: '#f8fafc',
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    fontSize: 13,
-    fontFamily: monoFont,
-  },
-  btnPrimary: {
-    backgroundColor: '#38bdf8',
-    borderRadius: 8,
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginTop: 2,
-  },
-  btnPrimaryText: {
-    color: '#0f172a',
-    fontWeight: '700',
-    fontSize: 12,
-  },
-  btnDanger: {
-    backgroundColor: 'rgba(239, 68, 68, 0.22)',
-    borderRadius: 8,
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginTop: 2,
-  },
-  btnDangerText: {
-    color: '#fca5a5',
-    fontWeight: '700',
-    fontSize: 12,
-  },
-  btnSecondarySm: {
-    backgroundColor: '#1e293b',
-    borderRadius: 6,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-  },
-  btnSecondaryText: {
-    color: '#f8fafc',
-    fontSize: 11,
-    fontWeight: '600',
-  },
-  btnOutlineSm: {
-    backgroundColor: '#1e293b',
-    borderRadius: 6,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-  },
-  btnOutlineText: {
-    color: '#cbd5e1',
-    fontSize: 11,
-    fontWeight: '600',
-  },
-  btnDisabled: {
-    opacity: 0.55,
-  },
-  scanningRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  discoveredBox: {
-    paddingVertical: 2,
-    gap: 4,
-  },
-  discoveredHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
-  discoveredHeaderText: {
-    color: '#94a3b8',
-    fontSize: 11,
-  },
-  closeBtnText: {
-    color: '#94a3b8',
-    fontSize: 12,
-    paddingHorizontal: 4,
-  },
-  discoveredItem: {
-    backgroundColor: '#1e293b',
-    borderRadius: 8,
-    padding: 8,
-  },
-  discoveredItemTop: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
-  discoveredIp: {
-    color: '#38bdf8',
-    fontFamily: monoFont,
-    fontWeight: '700',
-    fontSize: 12,
-  },
-  discoveredModel: {
-    color: '#f8fafc',
-    fontSize: 12,
-    fontWeight: '600',
-  },
-  discoveredSerial: {
-    color: '#94a3b8',
-    fontFamily: monoFont,
-    fontSize: 11,
-    marginTop: 2,
-  },
-  printerItemContainer: {
-    gap: 4,
-  },
-  printerInputRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  printerInput: {
-    flex: 1,
-  },
-  btnRemovePrinter: {
-    backgroundColor: 'rgba(239, 68, 68, 0.15)',
-    borderRadius: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  btnRemovePrinterText: {
-    color: '#f87171',
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  printerMetaBox: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 2,
-    paddingVertical: 2,
-    gap: 6,
-  },
-  printerDot: {
-    width: 6,
-    height: 6,
-    borderRadius: 3,
-  },
-  printerMetaTextCol: {
-    flex: 1,
-    gap: 2,
-  },
-  printerMetaLine: {
-    fontSize: 11,
-    fontFamily: monoFont,
-  },
-  metaDim: {
-    color: '#64748b',
-  },
-  metaValue: {
-    color: '#f8fafc',
-    fontWeight: '600',
-  },
-  metaAccent: {
-    color: '#38bdf8',
-    fontWeight: '600',
-  },
-  printerAlertText: {
-    color: '#fca5a5',
-    fontSize: 11,
-    fontWeight: '700',
-    marginTop: 2,
-  },
-  splitRow: {
-    flexDirection: 'row',
-    gap: 8,
-  },
-  halfCard: {
-    flex: 1,
-    justifyContent: 'space-between',
-  },
-  statusRowBox: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingVertical: 2,
-  },
-  statusRowLabel: {
-    color: '#f8fafc',
-    fontSize: 11,
-    fontWeight: '600',
-  },
-  pairInputRow: {
-    flexDirection: 'row',
-    gap: 6,
-    marginTop: 2,
-  },
-  pinInput: {
-    flex: 1,
-    paddingVertical: 6,
-  },
-  btnPair: {
-    backgroundColor: '#38bdf8',
-    borderRadius: 8,
-    paddingHorizontal: 10,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  headerRight: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
-  headerCloseBtn: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    backgroundColor: '#1e293b',
-    borderWidth: 1,
-    borderColor: '#334155',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  headerCloseBtnText: {
-    color: '#94a3b8',
-    fontSize: 13,
-    fontWeight: '700',
-    lineHeight: 14,
-  },
-  btnCloseApp: {
-    backgroundColor: '#1e293b',
-    borderWidth: 1,
-    borderColor: '#334155',
-    borderRadius: 8,
-    paddingVertical: 12,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginTop: 6,
-    marginBottom: 16,
-  },
-  btnCloseAppText: {
-    color: '#f8fafc',
-    fontSize: 13,
-    fontWeight: '700',
-    letterSpacing: 0.3,
-  },
-  toast: {
-    position: 'absolute',
-    bottom: 14,
-    left: 14,
-    right: 14,
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 8,
-    elevation: 6,
-  },
-  toastSuccess: {
-    backgroundColor: '#15803d',
-  },
-  toastError: {
-    backgroundColor: '#b91c1c',
-  },
-  toastText: {
-    color: '#f8fafc',
-    fontSize: 12,
-    fontWeight: '600',
+  dialogLeadingAction: {
+    marginRight: 'auto',
   },
 });
